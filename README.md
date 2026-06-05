@@ -9,12 +9,17 @@ cd sVObjTrack
 sr2  # System ROS 2 source
 uv venv --system-site-packages .venv
 source .venv/bin/activate
-uv pip install ultralytics
+uv pip install pyrealsense2
+uv pip install ultralytics opencv-python
 uv pip install 'numpy<2'
 # on my system this was required because of a systemwide installed matplotlib
 uv pip uninstall matplotlib
 pip uninstall matplotlib
 colcon build --cmake-args -DPYTHON_EXECUTABLE=$(which python) --symlink-install
+# sometimes you have to use the following instead
+uv pip install "setuptools<64.0.0"
+rm -rf build/ install/ log/
+python3 -m colcon build --symlink-install
 ```
 
 ## How to Use
@@ -33,6 +38,10 @@ ros2 run yolo11_ros2 yolo_node
 Second Terminal:
 ```bash
 ros2 run camera_nodes usb_camera
+```
+or
+```bash
+ros2 run camera_nodes realsense_camera
 ```
 
 Third Terminal:
