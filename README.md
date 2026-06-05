@@ -44,7 +44,13 @@ or
 ros2 run camera_nodes realsense_camera
 ```
 
-Third Terminal:
+Third Terminal (watch 2D object tracking in real-time):
 ```bash
 ros2 run rqt_image_view rqt_image_view
+```
+
+Fourth Terminal (inspect topics, output 3D detection stream):
+```bash
+ros2 topic list
+ros2 topic echo /yolo/detections_3d
 ```

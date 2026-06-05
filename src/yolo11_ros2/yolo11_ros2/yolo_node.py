@@ -154,7 +154,6 @@ class YOLO11Node(Node):
         if self.depth_image.dtype == np.uint16:
             # Intel RealSense driver [encoding = 16UC1]
             # units = millimeters
-            
             depth_m = float(depth) / 1000.0
         else:
             # Intel RealSense driver [encoding = 32FC1]
