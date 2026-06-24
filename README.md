@@ -1,6 +1,6 @@
 # Object Detection 
 Simple Ros2 project to detect and track objects and humans video feed of 2D RGB WebCam or Intel RealSense DepthCam
-Real-Time Detection and Tracking based on YOLO11 and ByteTrack
+Real-Time Detection and Tracking based on YOLO26 and ByteTrack
 
 ## Installation 
 ```bash
@@ -18,21 +18,21 @@ pip uninstall matplotlib
 colcon build --cmake-args -DPYTHON_EXECUTABLE=$(which python) --symlink-install
 # sometimes you have to use the following instead
 uv pip install "setuptools<64.0.0"
-rm -rf build/ install/ log/
+cbc # rm -rf build/ install/ log/
 python3 -m colcon build --symlink-install
 ```
 
 ## How to Use
 Start terminals with:
 ```bash
-sr2  # System ROS 2 source
-source .venv/bin/activate
-source install/setup.bash
+sr2      # source System ROS 2 
+act_venv # source venv
+sis      # source ROS 2 module install
 ```
 
 First Terminal:
 ```bash
-ros2 run yolo11_ros2 yolo_node
+ros2 run yolo26_ros2 yolo_node
 ```
 
 Second Terminal:

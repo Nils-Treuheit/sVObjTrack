@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>yolo11_ros2</name>
+  <name>yolo26_ros2</name>
   <version>0.0.0</version>
-  <description>YOLO11 object detection ROS2 node</description>
+  <description>YOLO26 object detection ROS2 node</description>
   <maintainer email="nils.treuheit@ovgu.de">nils</maintainer>
   <license>Apache-2.0</license>
 
