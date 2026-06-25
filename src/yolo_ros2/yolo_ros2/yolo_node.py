@@ -25,46 +25,85 @@ import cv2
 import torch
 from ultralytics import YOLO
 from geometry_msgs.msg import PointStamped
+from os.path import basename
+from random import randint
 
-MODEL_YOLO11 = "yolo11n.pt"
-MODEL_CUBIFIED = "yolo.pt"
+# Default Fallback Models
+MODEL_YOLO11= "models/yolo11m.pt"
+MODEL_YOLO26= "models/yolo26m.pt"
+MODEL_CUBIFIED = "models/yolo_cubified.pt"
+# model naming convention: <descriptor/name>-<type>.pt -> example: yolo26-obb.pt
 
-
-class YOLO26Node(Node):
+class YOLONode(Node):
     def __init__(self):
-        super().__init__('yolo26_node')
+        super().__init__('yolo_node')
 
-        self.declare_parameter("model_type", "cubified")
+        def translate_model_id(model_id, model_t):
+            if model_id == "yolo26":
+                path = MODEL_YOLO26
+                model_type = "AABB"
+            elif model_id == "cubified":
+                path = MODEL_CUBIFIED
+                model_type = "OBB"
+            elif model_id == "yolo11":
+                path = MODEL_YOLO11
+                model_type = "AABB"
+            elif model_id=="":
+                self.get_logger().warning(f"No model provided using YOLO26!")
+                path = MODEL_YOLO26
+                model_type = "AABB"
+            else:
+                self.get_logger().warning(f"Assuming model to be YOLO26-like, if no type provided and type not in model name assume AABB!")
+                path = model_id
+                mtype = basename(model_id).strip().split(".")[0].split('-')[-1]
+                model_type = model_t if model_t else (mtype if mtype else "AABB")
+            return path, model_type
+
+        self.declare_parameter("model_id", "")
+        self.declare_parameter("model_type", "")
+        self.declare_parameter("bb_tracker", "")
         self.declare_parameter("conf_threshold", 0.4)
 
-        model_type = self.get_parameter("model_type").value
+        model_id:str = self.get_parameter("model_id").value
+        model_type:str = self.get_parameter("model_type").value
+        bb_tracker:str = self.get_parameter("bb_tracker").value
         self.conf_threshold = self.get_parameter("conf_threshold").value
-
-        self.model_type = model_type
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        if model_type == "fusion":
-            self.model_a = YOLO(MODEL_YOLO11)
-            self.model_a.to(device)
-            self.model_b = YOLO(MODEL_CUBIFIED)
-            self.model_b.to(device)
-            self.get_logger().info(
-                f"Fusion mode: YOLO11 + Cubified OBB on {device}")
+        if model_id.startswith("["):
+            self.model_ids = [m_id.strip() for m_id in model_id.strip('[]').split(',')]
+            model_types = [m_t.strip() for m_t in model_type.strip('[]').split(',')]
+            model_types.extend([model_types[-1] for _ in range(len(self.model_ids)-len(model_types))]) 
+            self.bb_trackers = [bb_t.strip() for bb_t in bb_tracker.strip('[]').split(',')]
+            self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids)-len(bb_tracker))]) 
+
+            # model fusion
+            self.models = list()
+            self.model_types = list() 
+            for m_type,m_id in zip(model_types,self.model_ids):
+                path,m_t = translate_model_id(m_id, m_type) 
+                self.model_types.append(m_t) 
+                self.models.append(YOLO(path))
+                self.models[-1]  
+
+            self.get_logger().info(f"Fusion mode: combine YOLOs on {device}\n\t> (Models,Trackers):{list(zip(self.model_ids,self.bb_trackers))}")
         else:
-            if model_type == "yolo11" or model_type == "yolo26":
-                path = MODEL_YOLO11
-            elif model_type == "cubified":
-                path = MODEL_CUBIFIED
-            else:
-                self.get_logger().error(f"Unknown model_type: {model_type}, using yolo11")
-                path = MODEL_YOLO11
-                self.model_type = "yolo11"
+            self.model_ids = model_id
+            path, m_type = translate_model_id(model_id,model_type)
+            self.model_types = m_type
+            self.models = YOLO(path)
+            self.models.to(device)
+            self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
+        
+        # TODO: rename this into model color and add a super category coloring of boxes and add model_id to the label instead of current model based color coding
+        self.colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)] 
+        if len(self.colors)>len(self.models): self.colors[:len(self.models)]
+        else: 
+            self.colors = set(self.colors) 
+            while len(self.colors)<len(self.models): self.colors.add((randint(0,255),randint(0,255),randint(0,255)))
+            self.colors = list(self.colors)
 
-            self.model = YOLO(path)
-            self.model.to(device)
-            self.get_logger().info(f"Single model: {self.model_type} on {device}")
-
-        self.is_obb = (self.model_type == "cubified")
+        self.is_obb = ("OBB" in self.model_types)
         self.bridge = CvBridge()
 
         self.camera_source = "unknown"
@@ -136,19 +175,19 @@ class YOLO26Node(Node):
         det3d_msg.header = msg.header
         annotated = frame.copy()
 
-        if self.model_type == "fusion":
+        if isinstance(self.model_types,list):
             self._run_fusion(frame, annotated, det2d_msg, det3d_msg, msg, now)
         else:
-            results = self.model.track(
-                frame, persist=True, tracker="bytetrack.yaml",
+            results = self.models.track(
+                frame, persist=True, tracker=self.bb_trackers,
                 conf=self.conf_threshold, verbose=False)[0]
-
+            # TODO: restructure code so that we use the same _process... functions in fused and also introduce supercategory coloring to single model
             if self.is_obb and hasattr(results, 'obb') and results.obb is not None:
                 self._process_obb(results.obb, annotated, det2d_msg,
-                                  det3d_msg, msg, now, self.model)
+                                  det3d_msg, msg, now, self.models)
             elif results.boxes is not None:
                 self._process_boxes(results.boxes, annotated, det2d_msg,
-                                    det3d_msg, msg, now, self.model)
+                                    det3d_msg, msg, now, self.models)
 
         self.det2d_pub.publish(det2d_msg)
         if len(det3d_msg.detections) > 0:
@@ -161,53 +200,49 @@ class YOLO26Node(Node):
     # ----- fusion -----
 
     def _run_fusion(self, frame, annotated, det2d_msg, det3d_msg, img_msg, now):
-        r1 = self.model_a.track(
-            frame, persist=True, tracker="bytetrack.yaml",
-            conf=self.conf_threshold, verbose=False)[0]
-        r2 = self.model_b.track(
-            frame, persist=True, tracker="bytetrack.yaml",
-            conf=self.conf_threshold, verbose=False)[0]
+        predictions = [model.track(frame,persist=True, tracker=bb_tracker, conf=self.conf_threshold, verbose=False)[0] for model,bb_tracker in zip(self.models,self.bb_trackers)]
 
         candidates = []
-
-        if r1.boxes is not None:
-            for box in r1.boxes:
-                conf = float(box.conf[0])
-                if conf < self.conf_threshold:
-                    continue
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                candidates.append({
-                    'source': 'yolo11',
-                    'conf': conf,
-                    'cls_id': int(box.cls[0]),
-                    'class_name': self.model_a.names[int(box.cls[0])],
-                    'cx': (x1 + x2) / 2.0,
-                    'cy': (y1 + y2) / 2.0,
-                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                    'w': x2 - x1, 'h': y2 - y1,
-                    'angle_rad': None,
-                    'track_id': int(box.id[0]) if box.id is not None else None,
-                })
-
-        if hasattr(r2, 'obb') and r2.obb is not None:
-            for obb in r2.obb:
-                conf = float(obb.conf[0])
-                if conf < self.conf_threshold:
-                    continue
-                xywhr = obb.xywhr[0].cpu().numpy()
-                cx, cy, w, h, angle_rad = xywhr
-                candidates.append({
-                    'source': 'cubified',
-                    'conf': conf,
-                    'cls_id': int(obb.cls[0]),
-                    'class_name': self.model_b.names[int(obb.cls[0])],
-                    'cx': cx, 'cy': cy,
-                    'x1': cx - w / 2, 'y1': cy - h / 2,
-                    'x2': cx + w / 2, 'y2': cy + h / 2,
-                    'w': w, 'h': h,
-                    'angle_rad': angle_rad,
-                    'track_id': int(obb.id[0]) if obb.id is not None else None,
-                })
+        for preds,m_id,color in zip(predictions, self.model_ids, self.colors): 
+            if hasattr(preds, 'obb') and preds.obb is not None:
+                for obb in preds.obb:
+                    conf = float(obb.conf[0])
+                    if conf < self.conf_threshold:
+                        continue
+                    xywhr = obb.xywhr[0].cpu().numpy()
+                    cx, cy, w, h, angle_rad = xywhr
+                    candidates.append({
+                        'source': m_id,
+                        'color': color,
+                        'conf': conf,
+                        'cls_id': int(obb.cls[0]),
+                        'class_name': self.model_b.names[int(obb.cls[0])],
+                        'cx': cx, 'cy': cy,
+                        'x1': cx - w / 2, 'y1': cy - h / 2,
+                        'x2': cx + w / 2, 'y2': cy + h / 2,
+                        'w': w, 'h': h,
+                        'angle_rad': angle_rad,
+                        'track_id': int(obb.id[0]) if obb.id is not None else None,
+                    })
+            elif preds.boxes is not None:
+                for box in preds.boxes:
+                    conf = float(box.conf[0])
+                    if conf < self.conf_threshold:
+                        continue
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    candidates.append({
+                        'source': m_id,
+                        'color': color,
+                        'conf': conf,
+                        'cls_id': int(box.cls[0]),
+                        'class_name': self.model_a.names[int(box.cls[0])],
+                        'cx': (x1 + x2) / 2.0,
+                        'cy': (y1 + y2) / 2.0,
+                        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                        'w': x2 - x1, 'h': y2 - y1,
+                        'angle_rad': None,
+                        'track_id': int(box.id[0]) if box.id is not None else None,
+                    })
 
         fused = self._fuse_candidates(candidates)
 
@@ -215,6 +250,7 @@ class YOLO26Node(Node):
             self._publish_fused(det, annotated, det2d_msg, det3d_msg, img_msg, now)
 
     def _fuse_candidates(self, candidates):
+        # TODO: use ciou, if boxes are likely pointing at same object (high ciou) - prefer the prediction with an angle unless the the other prediction has a confidence that is 0.33 higher than the obb
         candidates.sort(key=lambda d: d['conf'], reverse=True)
         kept = []
         for det in candidates:
@@ -237,9 +273,10 @@ class YOLO26Node(Node):
         conf = det['conf']
         class_name = det['class_name']
 
-        source = det['source']
+        model_id = det['source']
+        color = det['color'] # TODO: change color to super category color (in total 20 for COCO + DOTAv1 class categories + 1 called Cube for Cube Faces, read super category from some translation map)
         is_obb_result = (det['angle_rad'] is not None)
-
+        src_tag = "OBB" if is_obb_result else "AABB"
         track_id = self._assign_track_id(det, now)
 
         point_3d = None
@@ -247,9 +284,6 @@ class YOLO26Node(Node):
                 and self.depth_image is not None
                 and self.camera_info is not None):
             point_3d = self.project_3d(cx, cy)
-
-        color = (255, 0, 0) if is_obb_result else (0, 255, 0)
-        src_tag = "OBB" if is_obb_result else "AAB"
 
         if is_obb_result:
             angle_rad = det['angle_rad']
@@ -269,6 +303,7 @@ class YOLO26Node(Node):
             label += f" ID:{track_id}"
         if point_3d:
             label += f" Z:{point_3d[2]:.2f}m"
+        # TODO: add model id to label
 
         lx = int(cx - det['w'] / 2)
         ly = max(20, int(cy - det['h'] / 2 - 5))
@@ -462,7 +497,7 @@ class YOLO26Node(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = YOLO26Node()
+    node = YOLONode()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
@@ -471,6 +506,6 @@ def main(args=None):
 if __name__ == "__main__":
     main()
 
-# ros2 run yolo26_ros2 yolo_node --ros-args -p model_type:=cubified
-# ros2 run yolo26_ros2 yolo_node --ros-args -p model_type:=yolo11
-# ros2 run yolo26_ros2 yolo_node --ros-args -p model_type:=fusion
+# ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=cubified
+# ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=yolo11
+# ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=fusion

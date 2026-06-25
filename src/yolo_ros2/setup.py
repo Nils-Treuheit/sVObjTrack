@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'yolo26_ros2'
+package_name = 'yolo_ros2'
 
 setup(
     name=package_name,
@@ -15,11 +15,11 @@ setup(
     zip_safe=True,
     maintainer='nils',
     maintainer_email='nils.treuheit@ovgu.de',
-    description='YOLO26 object detection ROS2 node',
+    description='YOLO object detection ROS2 node',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'yolo_node = yolo26_ros2.yolo_node:main',
+            'yolo_node = yolo_ros2.yolo_node:main',
         ],
     },
 )
