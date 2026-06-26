@@ -25,8 +25,10 @@ import cv2
 import torch
 from ultralytics import YOLO
 from geometry_msgs.msg import PointStamped
+from typing import Tuple,List,Union
 from os.path import basename
 from random import randint
+
 
 # Default Fallback Models
 MODEL_YOLO11= "models/yolo11m.pt"
@@ -69,6 +71,7 @@ class YOLONode(Node):
         bb_tracker:str = self.get_parameter("bb_tracker").value
         self.conf_threshold = self.get_parameter("conf_threshold").value
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.models:Union[List[YOLO],YOLO]
 
         if model_id.startswith("["):
             self.model_ids = [m_id.strip() for m_id in model_id.strip('[]').split(',')]
@@ -78,7 +81,7 @@ class YOLONode(Node):
             self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids)-len(bb_tracker))]) 
 
             # model fusion
-            self.models = list()
+            self.models:List[YOLO] = list()
             self.model_types = list() 
             for m_type,m_id in zip(model_types,self.model_ids):
                 path,m_t = translate_model_id(m_id, m_type) 
@@ -91,7 +94,7 @@ class YOLONode(Node):
             self.model_ids = model_id
             path, m_type = translate_model_id(model_id,model_type)
             self.model_types = m_type
-            self.models = YOLO(path)
+            self.models:YOLO = YOLO(path)
             self.models.to(device)
             self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
         
@@ -162,93 +165,49 @@ class YOLONode(Node):
         Y = (cy - cy0) * depth_m / fy
         Z = depth_m
         return (X, Y, Z)
-
-    # ----- image callback -----
-
-    def image_callback(self, msg: Image):
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        now = time.time()
-
-        det2d_msg = Detection2DArray()
-        det2d_msg.header = msg.header
-        det3d_msg = Detection3DArray()
-        det3d_msg.header = msg.header
-        annotated = frame.copy()
-
-        if isinstance(self.model_types,list):
-            self._run_fusion(frame, annotated, det2d_msg, det3d_msg, msg, now)
-        else:
-            results = self.models.track(
-                frame, persist=True, tracker=self.bb_trackers,
-                conf=self.conf_threshold, verbose=False)[0]
-            # TODO: restructure code so that we use the same _process... functions in fused and also introduce supercategory coloring to single model
-            if self.is_obb and hasattr(results, 'obb') and results.obb is not None:
-                self._process_obb(results.obb, annotated, det2d_msg,
-                                  det3d_msg, msg, now, self.models)
-            elif results.boxes is not None:
-                self._process_boxes(results.boxes, annotated, det2d_msg,
-                                    det3d_msg, msg, now, self.models)
-
-        self.det2d_pub.publish(det2d_msg)
-        if len(det3d_msg.detections) > 0:
-            self.det3d_pub.publish(det3d_msg)
-
-        debug_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
-        debug_msg.header = msg.header
-        self.image_pub.publish(debug_msg)
-
-    # ----- fusion -----
-
-    def _run_fusion(self, frame, annotated, det2d_msg, det3d_msg, img_msg, now):
-        predictions = [model.track(frame,persist=True, tracker=bb_tracker, conf=self.conf_threshold, verbose=False)[0] for model,bb_tracker in zip(self.models,self.bb_trackers)]
-
-        candidates = []
-        for preds,m_id,color in zip(predictions, self.model_ids, self.colors): 
-            if hasattr(preds, 'obb') and preds.obb is not None:
-                for obb in preds.obb:
-                    conf = float(obb.conf[0])
-                    if conf < self.conf_threshold:
-                        continue
-                    xywhr = obb.xywhr[0].cpu().numpy()
-                    cx, cy, w, h, angle_rad = xywhr
-                    candidates.append({
-                        'source': m_id,
-                        'color': color,
-                        'conf': conf,
-                        'cls_id': int(obb.cls[0]),
-                        'class_name': self.model_b.names[int(obb.cls[0])],
-                        'cx': cx, 'cy': cy,
-                        'x1': cx - w / 2, 'y1': cy - h / 2,
-                        'x2': cx + w / 2, 'y2': cy + h / 2,
-                        'w': w, 'h': h,
-                        'angle_rad': angle_rad,
-                        'track_id': int(obb.id[0]) if obb.id is not None else None,
-                    })
-            elif preds.boxes is not None:
-                for box in preds.boxes:
-                    conf = float(box.conf[0])
-                    if conf < self.conf_threshold:
-                        continue
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    candidates.append({
-                        'source': m_id,
-                        'color': color,
-                        'conf': conf,
-                        'cls_id': int(box.cls[0]),
-                        'class_name': self.model_a.names[int(box.cls[0])],
-                        'cx': (x1 + x2) / 2.0,
-                        'cy': (y1 + y2) / 2.0,
-                        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                        'w': x2 - x1, 'h': y2 - y1,
-                        'angle_rad': None,
-                        'track_id': int(box.id[0]) if box.id is not None else None,
-                    })
-
-        fused = self._fuse_candidates(candidates)
-
-        for det in fused:
-            self._publish_fused(det, annotated, det2d_msg, det3d_msg, img_msg, now)
-
+    
+    # --- retrieve box preds ---
+    def _process_boxes(self, preds, m_id:str, model:YOLO, color:Tuple[int,int,int]):
+        if hasattr(preds, 'obb') and preds.obb is not None:
+            for obb in preds.obb:
+                conf = float(obb.conf[0])
+                if conf < self.conf_threshold: continue
+                xywhr = obb.xywhr[0].cpu().numpy()
+                cx, cy, w, h, angle_rad = xywhr
+                return {
+                    'source': m_id,
+                    'color': color,
+                    'conf': conf,
+                    'cls_id': int(obb.cls[0]),
+                    'class_name': model.names[int(obb.cls[0])],
+                    'cx': cx, 'cy': cy,
+                    'x1': cx - w / 2, 'y1': cy - h / 2,
+                    'x2': cx + w / 2, 'y2': cy + h / 2,
+                    'w': w, 'h': h,
+                    'angle_rad': angle_rad,
+                    'track_id': int(obb.id[0]) if obb.id is not None else None,
+                }
+        elif preds.boxes is not None:
+            for box in preds.boxes:
+                conf = float(box.conf[0])
+                if conf < self.conf_threshold: continue
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                return {
+                    'source': m_id,
+                    'color': color,
+                    'conf': conf,
+                    'cls_id': int(box.cls[0]),
+                    'class_name': model.names[int(box.cls[0])],
+                    'cx': (x1 + x2) / 2.0,
+                    'cy': (y1 + y2) / 2.0,
+                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                    'w': x2 - x1, 'h': y2 - y1,
+                    'angle_rad': None,
+                    'track_id': int(box.id[0]) if box.id is not None else None,
+                }
+        raise NotImplementedError()
+    
+    # ----- fuse detections -----
     def _fuse_candidates(self, candidates):
         # TODO: use ciou, if boxes are likely pointing at same object (high ciou) - prefer the prediction with an angle unless the the other prediction has a confidence that is 0.33 higher than the obb
         candidates.sort(key=lambda d: d['conf'], reverse=True)
@@ -267,8 +226,33 @@ class YOLONode(Node):
             if not match:
                 kept.append(det)
         return kept
+    
+    # ----- assign track ids -----
+    def _assign_track_id(self, det, now):
+        cx, cy = det['cx'], det['cy']
+        cls_id = det['cls_id']
 
-    def _publish_fused(self, det, annotated, det2d_msg, det3d_msg, img_msg, now):
+        best_id = None
+        best_dist = 60.0
+        for tid, (tcx, tcy, tcls, tt) in self.track_history.items():
+            if tcls != cls_id:
+                continue
+            d = math.hypot(cx - tcx, cy - tcy)
+            if d < best_dist:
+                best_dist = d
+                best_id = tid
+
+        if best_id is not None:
+            self.track_history[best_id] = (cx, cy, cls_id, now)
+            return best_id
+        else:
+            new_id = self._next_track_id
+            self._next_track_id += 1
+            self.track_history[new_id] = (cx, cy, cls_id, now)
+            return new_id
+
+    # ----- publish detections -----
+    def _publish(self, det, annotated, det2d_msg, det3d_msg, img_msg, now):
         cx, cy = det['cx'], det['cy']
         conf = det['conf']
         class_name = det['class_name']
@@ -339,160 +323,38 @@ class YOLONode(Node):
             det3d.results.append(hyp)
             det3d_msg.detections.append(det3d)
 
-    def _assign_track_id(self, det, now):
-        cx, cy = det['cx'], det['cy']
-        cls_id = det['cls_id']
+    # ----- image callback -----
+    def image_callback(self, msg: Image):
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        now = time.time()
 
-        best_id = None
-        best_dist = 60.0
-        for tid, (tcx, tcy, tcls, tt) in self.track_history.items():
-            if tcls != cls_id:
-                continue
-            d = math.hypot(cx - tcx, cy - tcy)
-            if d < best_dist:
-                best_dist = d
-                best_id = tid
+        det2d_msg = Detection2DArray()
+        det2d_msg.header = msg.header
+        det3d_msg = Detection3DArray()
+        det3d_msg.header = msg.header
+        annotated = frame.copy()
 
-        if best_id is not None:
-            self.track_history[best_id] = (cx, cy, cls_id, now)
-            return best_id
+        if isinstance(self.models,List[YOLO]):
+            predictions = [model.track(frame,persist=True, tracker=bb_tracker, conf=self.conf_threshold, verbose=False)[0] for model,bb_tracker in zip(self.models,self.bb_trackers)]
+            candidates = []
+            for preds,m_id,model,color in zip(predictions, self.model_ids, self.models, self.colors): candidates.append(self._process_boxes(preds, m_id, model, color))
+            fused = self._fuse_candidates(candidates)
+            for det in fused: self._publish(det, annotated, det2d_msg, det3d_msg, msg, now)
         else:
-            new_id = self._next_track_id
-            self._next_track_id += 1
-            self.track_history[new_id] = (cx, cy, cls_id, now)
-            return new_id
+            preds = self.models.track(
+                frame, persist=True, tracker=self.bb_trackers,
+                conf=self.conf_threshold, verbose=False)[0]
+            # TODO: restructure code so that we use the same _process... functions in fused and also introduce supercategory coloring to single model
+            det = self._process_boxes(preds, m_id, model, color)
+            self._publish(det, annotated, det2d_msg, det3d_msg, msg, now)
 
-    # ----- single-model processors -----
+        self.det2d_pub.publish(det2d_msg)
+        if len(det3d_msg.detections) > 0:
+            self.det3d_pub.publish(det3d_msg)
 
-    def _process_boxes(self, boxes, annotated, det2d_msg, det3d_msg,
-                       img_msg, now, model):
-        for box in boxes:
-            conf = float(box.conf[0])
-            if conf < self.conf_threshold:
-                continue
-            cls_id = int(box.cls[0])
-            class_name = model.names[cls_id]
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            track_id = int(box.id[0]) if box.id is not None else None
-
-            if track_id is not None and track_id in self.track_history:
-                px, py, _, pt = self.track_history[track_id]
-                dt = now - pt
-                if dt > 0:
-                    _ = (cx - px) / dt  # vx
-                    _ = (cy - py) / dt  # vy
-            if track_id is not None:
-                self.track_history[track_id] = (cx, cy, cls_id, now)
-
-            point_3d = None
-            if (self.camera_source == "realsense"
-                    and self.depth_image is not None
-                    and self.camera_info is not None):
-                point_3d = self.project_3d(cx, cy)
-
-            label = f"{class_name} {conf:.2f}"
-            if track_id is not None:
-                label += f" ID:{track_id}"
-            if point_3d:
-                label += f" Z:{point_3d[2]:.2f}m"
-
-            x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(annotated, label, (x1, max(20, y1 - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            det2d = Detection2D()
-            det2d.bbox.center.position.x = float(cx)
-            det2d.bbox.center.position.y = float(cy)
-            det2d.bbox.size_x = float(x2 - x1)
-            det2d.bbox.size_y = float(y2 - y1)
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = class_name
-            hyp.hypothesis.score = conf
-            det2d.results.append(hyp)
-            det2d_msg.detections.append(det2d)
-
-            if point_3d:
-                pt = PointStamped()
-                pt.header = img_msg.header
-                pt.point.x, pt.point.y, pt.point.z = point_3d
-                self.point_pub.publish(pt)
-                det3d = Detection3D()
-                det3d.bbox.center.position.x = point_3d[0]
-                det3d.bbox.center.position.y = point_3d[1]
-                det3d.bbox.center.position.z = point_3d[2]
-                det3d.results.append(hyp)
-                det3d_msg.detections.append(det3d)
-
-    def _process_obb(self, obb_data, annotated, det2d_msg, det3d_msg,
-                     img_msg, now, model):
-        for obb in obb_data:
-            conf = float(obb.conf[0])
-            if conf < self.conf_threshold:
-                continue
-            cls_id = int(obb.cls[0])
-            class_name = model.names[cls_id]
-            xywhr = obb.xywhr[0].cpu().numpy()
-            cx, cy, w, h, angle_rad = xywhr
-            track_id = int(obb.id[0]) if obb.id is not None else None
-
-            if track_id is not None and track_id in self.track_history:
-                px, py, _, pt = self.track_history[track_id]
-                dt = now - pt
-                if dt > 0:
-                    _ = (cx - px) / dt
-                    _ = (cy - py) / dt
-            if track_id is not None:
-                self.track_history[track_id] = (cx, cy, cls_id, now)
-
-            point_3d = None
-            if (self.camera_source == "realsense"
-                    and self.depth_image is not None
-                    and self.camera_info is not None):
-                point_3d = self.project_3d(cx, cy)
-
-            angle_deg = math.degrees(angle_rad)
-            rect = ((float(cx), float(cy)), (float(w), float(h)), float(angle_deg))
-            box_pts = cv2.boxPoints(rect)
-            box_pts = np.int32(box_pts)
-            cv2.polylines(annotated, [box_pts], True, (255, 0, 0), 2)
-
-            label = f"{class_name} {conf:.2f}"
-            if track_id is not None:
-                label += f" ID:{track_id}"
-            if point_3d:
-                label += f" Z:{point_3d[2]:.2f}m"
-            lx = int(cx - w / 2)
-            ly = max(20, int(cy - h / 2 - 5))
-            cv2.putText(annotated, label, (lx, ly),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-            det2d = Detection2D()
-            det2d.bbox.center.position.x = float(cx)
-            det2d.bbox.center.position.y = float(cy)
-            det2d.bbox.size_x = float(w)
-            det2d.bbox.size_y = float(h)
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = class_name
-            hyp.hypothesis.score = conf
-            hyp.pose.pose.orientation.z = math.sin(angle_rad / 2.0)
-            hyp.pose.pose.orientation.w = math.cos(angle_rad / 2.0)
-            det2d.results.append(hyp)
-            det2d_msg.detections.append(det2d)
-
-            if point_3d:
-                pt = PointStamped()
-                pt.header = img_msg.header
-                pt.point.x, pt.point.y, pt.point.z = point_3d
-                self.point_pub.publish(pt)
-                det3d = Detection3D()
-                det3d.bbox.center.position.x = point_3d[0]
-                det3d.bbox.center.position.y = point_3d[1]
-                det3d.bbox.center.position.z = point_3d[2]
-                det3d.results.append(hyp)
-                det3d_msg.detections.append(det3d)
+        debug_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+        debug_msg.header = msg.header
+        self.image_pub.publish(debug_msg)
 
 
 def main(args=None):
