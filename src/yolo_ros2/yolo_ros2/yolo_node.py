@@ -24,6 +24,7 @@ import cv2
 
 import torch
 from ultralytics import YOLO
+from moe_yolo.moe_model import MoEYOLO
 from geometry_msgs.msg import PointStamped
 from typing import Tuple,List,Union
 from os.path import basename
@@ -35,6 +36,8 @@ MODEL_YOLO11= "models/yolo11m.pt"
 MODEL_YOLO26= "models/yolo26m.pt"
 MODEL_CUBIFIED = "models/yolo_cubified.pt"
 # model naming convention: <descriptor/name>-<type>.pt -> example: yolo26-obb.pt
+NC_CUBE = 66
+NC_NORMAL = 95
 
 class YOLONode(Node):
     def __init__(self):
@@ -71,7 +74,7 @@ class YOLONode(Node):
         bb_tracker:str = self.get_parameter("bb_tracker").value
         self.conf_threshold = self.get_parameter("conf_threshold").value
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.models:Union[List[YOLO],YOLO]
+        self.models:Union[List[YOLO],YOLO,MoEYOLO]
 
         if model_id.startswith("["):
             self.model_ids = [m_id.strip() for m_id in model_id.strip('[]').split(',')]
@@ -81,12 +84,12 @@ class YOLONode(Node):
             self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids)-len(bb_tracker))]) 
 
             # model fusion
-            self.models:List[YOLO] = list()
+            self.models = list()
             self.model_types = list() 
             for m_type,m_id in zip(model_types,self.model_ids):
                 path,m_t = translate_model_id(m_id, m_type) 
                 self.model_types.append(m_t) 
-                self.models.append(YOLO(path))
+                self.models.append(MoEYOLO(path,NC_NORMAL,NC_CUBE) if "MoE" in model_id else YOLO(path))
                 self.models[-1]  
 
             self.get_logger().info(f"Fusion mode: combine YOLOs on {device}\n\t> (Models,Trackers):{list(zip(self.model_ids,self.bb_trackers))}")
@@ -94,13 +97,14 @@ class YOLONode(Node):
             self.model_ids = model_id
             path, m_type = translate_model_id(model_id,model_type)
             self.model_types = m_type
-            self.models:YOLO = YOLO(path)
+            self.models = MoEYOLO(path,NC_NORMAL,NC_CUBE) if "MoE" in model_id else YOLO(path)
             self.models.to(device)
             self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
         
         # TODO: rename this into model color and add a super category coloring of boxes and add model_id to the label instead of current model based color coding
         self.colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)] 
-        if len(self.colors)>len(self.models): self.colors[:len(self.models)]
+        if isinstance(self.models,YOLO): self.colors = self.colors[0]
+        elif len(self.colors)>len(self.models): self.colors = self.colors[:len(self.models)]
         else: 
             self.colors = set(self.colors) 
             while len(self.colors)<len(self.models): self.colors.add((randint(0,255),randint(0,255),randint(0,255)))
@@ -334,7 +338,7 @@ class YOLONode(Node):
         det3d_msg.header = msg.header
         annotated = frame.copy()
 
-        if isinstance(self.models,List[YOLO]):
+        if isinstance(self.models,list):
             predictions = [model.track(frame,persist=True, tracker=bb_tracker, conf=self.conf_threshold, verbose=False)[0] for model,bb_tracker in zip(self.models,self.bb_trackers)]
             candidates = []
             for preds,m_id,model,color in zip(predictions, self.model_ids, self.models, self.colors): candidates.append(self._process_boxes(preds, m_id, model, color))
