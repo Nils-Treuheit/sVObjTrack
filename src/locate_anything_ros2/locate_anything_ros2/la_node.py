@@ -39,6 +39,7 @@ from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithP
 from geometry_msgs.msg import PointStamped
 import cv2
 import numpy as np
+import json
 from PIL import Image as PILImage
 
 # cv_bridge may fail under numpy 2.x; guard both import and instantiation
@@ -77,18 +78,37 @@ else:
     _TRT_AVAILABLE = False
 
 
-def parse_boxes(text: str) -> list:
-    """Extract bounding boxes from LA <box> tag output.
+def parse_detections(text: str) -> list:
+    """Extract (label, [x1,y1,x2,y2]) pairs from LA <box> output.
 
-    Returns list of [x1, y1, x2, y2] or [x, y] with normalized coords (0-1).
+    Handles formats like:
+      "<ref>label</ref><box>x1,y1,x2,y2</box>"   (OCR/grounding)
+      "<box>x1,y1,x2,y2</box> person"             (detection)
+      "a person <box>x1,y1,x2,y2</box>"
+      "<box>x1,y1,x2,y2</box>"
+
+    Returns list of (class_name, [x1, y1, x2, y2]  or  [x, y]).
     """
-    boxes = []
+    results = []
     for match in re.finditer(r'<box>(.+?)</box>', text):
-        content = match.group(1).strip()
-        coords = [float(p) for p in re.findall(r'[\d.]+', content)]
-        if len(coords) in (2, 4):
-            boxes.append(coords)
-    return boxes
+        coords_str = match.group(1)
+        coords = [float(p) for p in re.findall(r'[\d.]+', coords_str)]
+        if len(coords) not in (2, 4):
+            continue
+
+        # Try <ref> tag before the box (OCR/grounding format)
+        before = text[:match.start()]
+        ref_matches = re.findall(r'<ref>(.+?)</ref>', before)
+        if ref_matches:
+            label = ref_matches[-1].strip()
+        else:
+            # Fallback: label = text right after the closing tag (first ~3 words)
+            end = match.end()
+            context = text[end:end+60].strip().rstrip(',').rstrip('.').strip()
+            label = ' '.join(context.split()[:3]) if context else "object"
+
+        results.append((label, coords))
+    return results
 
 
 def classify_query(query: str) -> str:
@@ -116,6 +136,39 @@ def classify_query(query: str) -> str:
     return 'detect'
 
 
+def load_objects(filepath: str) -> list:
+    """Load object class list from a JSON file.
+    
+    Expected format:
+      {"objects": ["person", "monitor", ...], "ocr": ["A", "B", ...]}
+    Only the 'objects' list is used for detection. OCR is done via
+    grounding query ("read the text on the cube") through the ad-hoc
+    /la/grounding_query topic.
+    Falls back to a default list if the file cannot be read.
+    """
+    default = ["person", "monitor", "pc", "robot", "plant", "cube", "cup", "book", "laptop", "cell phone",
+               "purse", "backpack", "bottle", "mug", "tv", "ball", "painting", "pen", "keys", "glasses", "hat"]
+    p = Path(filepath)
+    if not p.exists():
+        # Try relative to workspace root
+        p = Path(__file__).resolve().parent.parent.parent.parent / filepath
+    if not p.exists():
+        print(f"[LA Node] Objects file not found: {filepath}, using defaults")
+        return default
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        objs = data.get("objects", default)
+        if not objs:
+            return default
+        ocr = data.get("ocr", [])
+        print(f"[LA Node] Loaded {len(objs)} objects (+ {len(ocr)} OCR chars for grounding queries) from {p}")
+        return objs
+    except Exception as e:
+        print(f"[LA Node] Error loading objects file: {e}, using defaults")
+        return default
+
+
 class LocateAnythingROS2(Node):
     """ROS2 node for LocateAnything visual grounding with TRT acceleration."""
 
@@ -123,21 +176,20 @@ class LocateAnythingROS2(Node):
         super().__init__('la_node')
 
         # Parameters
-        self.declare_parameter('detect_queries', '["person", "car", "dog", "chair"]')
-        self.declare_parameter('interval_frames', 30)
+        self.declare_parameter('objects_file', 'config/la_objects.json')
+        self.declare_parameter('interval_frames', 15)
         self.declare_parameter('conf_threshold', 0.3)
-        self.declare_parameter('max_new_tokens', 32)
+        self.declare_parameter('max_new_tokens', 128)
+        self.declare_parameter('grounding_max_new_tokens', 1024)
         self.declare_parameter('debug', True)
 
-        detect_queries_str = self.get_parameter('detect_queries').value
-        self.detect_queries = eval(detect_queries_str)
+        objects_file = self.get_parameter('objects_file').value
+        self.detect_objects = load_objects(objects_file)
         self.interval_frames = self.get_parameter('interval_frames').value
         self.conf_threshold = self.get_parameter('conf_threshold').value
         self.max_new_tokens = self.get_parameter('max_new_tokens').value
+        self.grounding_max_new_tokens = self.get_parameter('grounding_max_new_tokens').value
         self.debug_mode = self.get_parameter('debug').value
-
-        if not isinstance(self.detect_queries, list):
-            self.detect_queries = [self.detect_queries]
 
         if _CV_BRIDGE_OK:
             self.bridge = CvBridge()
@@ -191,9 +243,9 @@ class LocateAnythingROS2(Node):
         self._load_model_async()
 
         self.get_logger().info(
-            f'LA Node started. Queries: {self.detect_queries}, '
-            f'interval: {self.interval_frames} frames, '
-            f'TRT: {_TRT_AVAILABLE}'
+            f'LA Node started. Objects ({len(self.detect_objects)}): {self.detect_objects}, '
+            f'interval: {self.interval_frames} frames. '
+            f'OCR via grounding query: "read the text on the cube"'
         )
 
     def _load_model(self):
@@ -291,14 +343,15 @@ class LocateAnythingROS2(Node):
                 cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB))
             t0 = time.time()
             text = self.la.ground(pil_img, query,
-                                  max_new_tokens=self.max_new_tokens, temperature=0)
+                                  max_new_tokens=self.grounding_max_new_tokens, temperature=0)
             elapsed = (time.time() - t0) * 1000
-            boxes = parse_boxes(text)
+            dets = parse_detections(text)
             task_type = classify_query(query)
 
             result = f'[LA Grounding] Query: "{query}"\n{text}\n'
-            if boxes:
-                result += f'Boxes: {boxes}\n'
+            if dets:
+                dets_str = ', '.join(f'{l} {c}' for l, c in dets)
+                result += f'Detections: {dets_str}\n'
             result += f'Time: {elapsed:.0f}ms'
 
             self.get_logger().info(result)
@@ -306,42 +359,66 @@ class LocateAnythingROS2(Node):
             msg.data = result
             self.grounding_pub.publish(msg)
 
-            # Also draw on debug frame if available
-            if boxes:
+            if dets:
                 h, w = self.latest_frame.shape[:2]
                 with self.lock:
-                    self.detections = [{
-                        'source': 'grounding',
-                        'class_name': query,
-                        'conf': 1.0,
-                        'cx': (b[0] + b[2]) * w / 2 if len(b) == 4 else b[0] * w,
-                        'cy': (b[1] + b[3]) * h / 2 if len(b) == 4 else b[1] * h,
-                        'x1': b[0] * w if len(b) == 4 else b[0] * w,
-                        'y1': b[1] * h if len(b) == 4 else b[1] * h,
-                        'x2': b[2] * w if len(b) == 4 else b[0] * w,
-                        'y2': b[3] * h if len(b) == 4 else b[1] * h,
-                        'w': (b[2] - b[0]) * w if len(b) == 4 else 0,
-                        'h': (b[3] - b[1]) * h if len(b) == 4 else 0,
-                        'angle_rad': None,
-                        'color': (0, 255, 255),
-                        'pose_text': text if task_type == 'pose' else None,
-                    } for b in boxes]
+                    self.detections = []
+                    for label, b in dets:
+                        self.detections.append({
+                            'source': 'grounding',
+                            'class_name': label,
+                            'conf': 1.0,
+                            'cx': ((b[0] + b[2]) / 1000.0) * w / 2 if len(b) == 4 else (b[0] / 1000.0) * w,
+                            'cy': ((b[1] + b[3]) / 1000.0) * h / 2 if len(b) == 4 else (b[1] / 1000.0) * h,
+                            'x1': (b[0] / 1000.0) * w if len(b) == 4 else (b[0] / 1000.0) * w,
+                            'y1': (b[1] / 1000.0) * h if len(b) == 4 else (b[1] / 1000.0) * h,
+                            'x2': (b[2] / 1000.0) * w if len(b) == 4 else (b[0] / 1000.0) * w,
+                            'y2': (b[3] / 1000.0) * h if len(b) == 4 else (b[1] / 1000.0) * h,
+                            'w': ((b[2] - b[0]) / 1000.0) * w if len(b) == 4 else 0,
+                            'h': ((b[3] - b[1]) / 1000.0) * h if len(b) == 4 else 0,
+                            'angle_rad': None,
+                            'color': (0, 255, 255),
+                        })
                     self.last_query_label = query
                     self.last_query_type = task_type
         except Exception as e:
             self.get_logger().error(f'Grounding failed: {e}')
 
+    def _build_detection_query(self) -> str:
+        """Build single comprehensive query with previous-frame context."""
+        items = ", ".join(self.detect_objects)
+        query = f"Detect all of the following in this scene: {items}. For each one output <box>x1,y1,x2,y2</box> class_name."
+
+        # Prepend previous frame's detections as context (from 2nd query onward)
+        with self.lock:
+            prev = list(self.detections)
+        if not prev:
+            return query
+
+        ctx_parts = []
+        h, w = 480, 640  # fallback — will be updated if we have a frame
+        if self.latest_frame is not None:
+            h, w = self.latest_frame.shape[:2]
+        for d in prev[:20]:  # limit to 20 objects
+            tid = d.get('track_id')
+            cn = d['class_name']
+            # Convert pixel coords back to LA token format [0,1000] for the prompt
+            nx1 = int((d['x1'] / w) * 1000) if w else 0
+            ny1 = int((d['y1'] / h) * 1000) if h else 0
+            nx2 = int((d['x2'] / w) * 1000) if w else 0
+            ny2 = int((d['y2'] / h) * 1000) if h else 0
+            box = f"{nx1},{ny1},{nx2},{ny2}"
+            ctx_parts.append(f"<box>{box}</box> {cn} ID:{tid}" if tid else f"<box>{box}</box> {cn}")
+        ctx = ", ".join(ctx_parts)
+        return f"Previously detected: {ctx}. {query}"
+
     def _run_detection(self, frame, header):
-        """Run LA detection query for current frame."""
+        """Run LA detection — one query lists all objects, replaces previous detections."""
         if self.la is None:
             return
 
-        # Pick the next query in round-robin
-        query = self.detect_queries[self.query_idx % len(self.detect_queries)]
-        self.query_idx += 1
-        task_type = classify_query(query)
-        self.last_query_type = task_type
-        self.last_query_label = query
+        query = self._build_detection_query()
+        self.last_query_label = query[:80]
 
         try:
             pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -350,23 +427,26 @@ class LocateAnythingROS2(Node):
                                   max_new_tokens=self.max_new_tokens, temperature=0)
             elapsed = (time.time() - t0) * 1000
             self.last_inference_time = elapsed
-            boxes = parse_boxes(text)
+            dets = parse_detections(text)
 
-            detections = []
+            new_dets = []
             h, w = frame.shape[:2]
-            for b in boxes:
+            for label, b in dets:
                 if len(b) == 4:
                     x1, y1, x2, y2 = b
-                    # Normalized coords -> pixel
-                    x1, y1, x2, y2 = x1 * w, y1 * h, x2 * w, y2 * h
+                    x1 = (x1 / 1000.0) * w
+                    y1 = (y1 / 1000.0) * h
+                    x2 = (x2 / 1000.0) * w
+                    y2 = (y2 / 1000.0) * h
                 elif len(b) == 2:
-                    cx, cy = b[0] * w, b[1] * h
+                    cx = (b[0] / 1000.0) * w
+                    cy = (b[1] / 1000.0) * h
                     x1, y1, x2, y2 = cx - 10, cy - 10, cx + 10, cy + 10
                 else:
                     continue
-                detections.append({
-                    'source': query,
-                    'class_name': query,
+                new_dets.append({
+                    'source': 'detect',
+                    'class_name': label,
                     'conf': 1.0,
                     'cx': (x1 + x2) / 2.0,
                     'cy': (y1 + y2) / 2.0,
@@ -376,35 +456,40 @@ class LocateAnythingROS2(Node):
                     'h': y2 - y1,
                     'angle_rad': None,
                     'color': (0, 255, 0),
-                    'pose_text': text if task_type == 'pose' else None,
                 })
 
-            # Assign track IDs
             now = time.time()
-            for det in detections:
+            for det in new_dets:
                 det['track_id'] = self._assign_track_id(det, now)
 
             with self.lock:
-                self.detections = detections
+                self.detections = new_dets
 
             if self.debug_mode:
                 self.get_logger().info(
-                    f'[LA] "{query}": {len(boxes)} boxes in {elapsed:.0f}ms, '
-                    f'frame {self.frame_count}, type={task_type}')
+                    f'[LA] detection: {len(new_dets)} boxes in {elapsed:.0f}ms, '
+                    f'frame {self.frame_count}')
 
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')
 
     def _assign_track_id(self, det, now):
-        """Simple nearest-neighbor track ID assignment."""
+        """Simple nearest-neighbor track ID assignment with stale cleanup."""
         cx, cy = det['cx'], det['cy']
         best_id = None
-        best_dist = 100.0
+        best_dist = 200.0
+        stale_cutoff = now - 5.0
+        stale_ids = []
         for tid, (tcx, tcy, tt) in list(self.track_history.items()):
+            if tt < stale_cutoff:
+                stale_ids.append(tid)
+                continue
             d = math.hypot(cx - tcx, cy - tcy)
             if d < best_dist:
                 best_dist = d
                 best_id = tid
+        for sid in stale_ids:
+            del self.track_history[sid]
         if best_id is not None:
             self.track_history[best_id] = (cx, cy, now)
             return best_id
@@ -415,35 +500,45 @@ class LocateAnythingROS2(Node):
             return new_id
 
     def _draw_detections(self, annotated, detections):
-        """Draw bounding boxes, labels, and pose text on the frame."""
+        """Draw bounding boxes and YOLO-style labels on the frame."""
+        h_img, w_img = annotated.shape[:2]
         for det in detections:
             x1, y1, x2, y2 = map(int, [det['x1'], det['y1'], det['x2'], det['y2']])
+            x1 = max(0, min(x1, w_img - 1))
+            y1 = max(0, min(y1, h_img - 1))
+            x2 = max(0, min(x2, w_img - 1))
+            y2 = max(0, min(y2, h_img - 1))
             color = det.get('color', (0, 255, 0))
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
-            label = det['class_name']
+            # Center point (LA point-mode style)
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            cv2.circle(annotated, (cx, cy), radius=5, color=(0, 0, 255), thickness=-1)
+
+            class_name = det['class_name']
+            conf = det.get('conf', 1.0)
             track_id = det.get('track_id')
+            w = x2 - x1
+            h = y2 - y1
+
+            # Match YOLO label format: class conf [TYPE] ID:id Z:zm
+            label = f'{class_name} {conf:.2f} [AABB]'
             if track_id is not None:
                 label += f' ID:{track_id}'
 
-            lx, ly = x1, max(20, y1 - 5)
+            # Add Z distance when depth available
+            if self.camera_source == "realsense" and self.depth_image is not None and self.camera_info is not None:
+                pt3d = self.project_3d(cx, cy)
+                if pt3d:
+                    label += f' Z:{pt3d[2]:.2f}m'
+
+            # Top-center label position (matches YOLO)
+            lx = int(cx - w / 2)
+            ly = max(20, int(cy - h / 2 - 5))
             cv2.putText(annotated, label, (lx, ly),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            # Draw pose description text below the box
-            pose_text = det.get('pose_text')
-            if pose_text:
-                pose_lines = pose_text.split('.')[:2]  # first 2 sentences max
-                for li, line in enumerate(pose_lines):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    ty = y2 + 15 + li * 14
-                    if ty > annotated.shape[0] - 10:
-                        break
-                    cv2.putText(annotated, line[:50], (x1, ty),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
     def _publish_detections(self, detections, header):
         """Publish detection results as vision_msgs messages."""
@@ -462,13 +557,6 @@ class LocateAnythingROS2(Node):
             hyp = ObjectHypothesisWithPose()
             hyp.hypothesis.class_id = det['class_name']
             hyp.hypothesis.score = det.get('conf', 1.0)
-
-            # Store pose text in the pose field if available
-            pose_text = det.get('pose_text')
-            if pose_text:
-                # Encode pose text into orientation as simple flag
-                hyp.pose.pose.position.z = 1.0  # marker for pose result
-
             d2d.results.append(hyp)
             det2d_msg.detections.append(d2d)
 
@@ -522,13 +610,7 @@ class LocateAnythingROS2(Node):
             self._draw_detections(annotated, active_dets)
             self._publish_detections(active_dets, msg.header)
 
-        # Show inference overlay
-        if self.last_inference_time > 0:
-            status = f'LA: {self.last_inference_time:.0f}ms | {len(active_dets)} tracked | {self.last_query_label}'
-            cv2.putText(annotated, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # Publish debug image
         debug_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
         debug_msg.header = msg.header
         self.image_pub.publish(debug_msg)

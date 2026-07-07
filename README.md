@@ -27,7 +27,7 @@ ros2 launch camera_nodes cameras.launch.py 0
 ./run_yolo_node.sh '[yolo26, yolo11-pose]'        # AABB + pose fusion
 ./run_yolo_node.sh '[yolo26, cubified, yolo11-pose]'  # AABB + OBB + pose fusion
 
-# Terminal 3: LocateAnything visual grounding (TRT-accelerated)
+# Terminal 3: LocateAnything per-class object detection (TRT-accelerated)
 ./run_la_node.sh
 
 # Terminal 4: Watch detections
@@ -60,12 +60,54 @@ for cv_bridge ABI compatibility) and to set up the TRT library path.
 ### `run_la_node.sh`
 Activates venv + ROS2 + sets `LD_LIBRARY_PATH` for TRT. Runs
 LocateAnything-3B with vision encoder via TensorRT EP (~10ms/frame).
-Subscribes to `/camera/image_raw`, publishes to `/la/detections_2d`,
-`/la/detections_3d` (with depth), and `/la/debug_image`. Grounding
-results go to `/la/grounding_text`.
+Subscribes to `/camera/image_raw`, cycles through object classes from
+`config/la_objects.json` (one class per `interval_frames`), drawing
+bounding boxes with class labels on `/la/debug_image` and publishing
+structured detections to `/la/detections_2d` and `/la/detections_3d`
+(with depth). Free-text grounding results are published to
+`/la/grounding_text` only when triggered via `/la/grounding_query`.
 
 ```
 ./run_la_node.sh
+```
+
+To use a custom object list:
+```bash
+./run_la_node.sh --ros-args -p objects_file:=my_objects.json
+```
+
+### `run_la_grounding.sh`
+One-shot ad-hoc visual grounding query against a running LA node.
+Pass the object(s) you want to find — the query is sent to
+`/la/grounding_query` and the response is printed (text on
+`/la/grounding_text`, boxes drawn on `/la/debug_image`).
+
+Find objects:
+```
+./run_la_grounding.sh "human plant chair"          # find all humans, plants, chairs
+./run_la_grounding.sh "car"                        # find all cars
+```
+
+Referring / relational (attribute-based selection):
+```
+./run_la_grounding.sh "select the cube with a 2"             # object with specific attribute
+./run_la_grounding.sh "find the person wearing a red hat"    # relational
+./run_la_grounding.sh "the cube that has the letter A on it" # attribute-based
+./run_la_grounding.sh "plant closest to the person"          # spatial relation
+```
+
+OCR (read text from objects):
+```
+./run_la_grounding.sh "read the text on the cube"
+./run_la_grounding.sh "find all text in this scene"
+./run_la_grounding.sh "read what it says"
+```
+
+GUI-style (pointing / clicking):
+```
+./run_la_grounding.sh "select the submit button"
+./run_la_grounding.sh "click the red icon in the top right"
+./run_la_grounding.sh "point to the settings menu"
 ```
 
 ### `run_yolo_node.sh`
@@ -142,11 +184,25 @@ Each topic only exists when its publishing node is loaded:
 ## Parameters
 
 ### la_node
-- `detect_queries` (default: `["person","car","dog","chair"]`) — round-robin queries
-- `interval_frames` (default: 30) — frames between LA inferences
-- `conf_threshold` (default: 0.3)
-- `max_new_tokens` (default: 32)
-- `debug` (default: true)
+- `objects_file` (default: `config/la_objects.json`) — JSON file with objects to detect (`{"objects": ["person", ...], "ocr": ["A", "B", ...]}`). Detection uses the full list in a single query — one inference per interval detects all listed object types at once. The `ocr` list is for reference only (used in grounding queries, not detection).
+- `interval_frames` (default: `15`) — frames between LA inferences
+- `conf_threshold` (default: `0.3`)
+- `max_new_tokens` (default: `128`) — token limit for detection queries (output is parsed for `<box>` tags only)
+- `grounding_max_new_tokens` (default: `1024`) — longer token limit for ad-hoc grounding queries (free-text response published to `/la/grounding_text`)
+- `debug` (default: `true`)
+
+**Detection** uses one comprehensive query listing all objects:  
+`"Detect all of the following in this scene: person, monitor, pc, robot, ... For each one output <box>x1,y1,x2,y2</box> class_name."`
+
+**OCR** (reading text on cubes) is done via the grounding query — not part of the detection cycle:  
+`./run_la_grounding.sh "read the text on the cube"`
+
+Ad-hoc grounding is done via topic:
+```bash
+ros2 topic pub -1 /la/grounding_query std_msgs/msg/String "data: 'human plant chair'"
+# or use the wrapper:
+./run_la_grounding.sh "human plant chair"
+```
 
 ### yolo_node
 - `model_id` — path or shortcut: `yolo11`/`yolo26`/`cubified`/`yolo11-pose`/`yolo26-pose`
@@ -189,9 +245,16 @@ In fusion mode, each model can use a different tracker:
   advertise depth topics.
 - **Multi-object tracking**: YOLO returns all detections above threshold;
   each gets a persistent track ID via centroid nearest-neighbor matching.
+- **LA detection & grounding**: Separate pipelines. **Detection** runs a single comprehensive query listing all objects from `config/la_objects.json` — one inference every `interval_frames` returns all object types at once. **Grounding** runs on-demand via `/la/grounding_query` and publishes free-text results to `/la/grounding_text`. Each detection query replaces the previous frame's detections entirely.
+- **OCR on cubes**: Not part of the detection cycle. Run via the grounding module:
+  ```bash
+  ./run_la_grounding.sh "read the text on the cube"
+  ./run_la_grounding.sh "find all text in this scene"
+  ./run_la_grounding.sh "read what it says on the cube"
+  ```
+  LA returns `<ref>text</ref><box>x1,y1,x2,y2</box>` for each text region — the recognized text becomes the detection label, and boxes are drawn on the debug image with center points. The `ocr` list in `config/la_objects.json` documents which characters to look for.
 - **Pose estimation**: YOLO pose models draw COCO 17-keypoint skeleton with
-  colored joints and limb connections on the debug image. LA pose queries
-  display descriptive pose text under each detection box.
+  colored joints and limb connections on the debug image.
 - **3D projection**: YOLO and LA both project bounding box centers to 3D
   using RealSense depth. Published as `Detection3DArray` and `PointStamped`.
 - **TRT engines** are SM120-specific (RTX 5090). Rebuild for other GPUs:
