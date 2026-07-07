@@ -35,8 +35,10 @@ from random import randint
 MODEL_YOLO11 = "models/yolo11m.pt"
 MODEL_YOLO26 = "models/yolo26m.pt"
 MODEL_CUBIFIED = "models/yolo_cubified.pt"
-MODEL_YOLO11_POSE = "models/yolo11m-pose.pt"
-MODEL_YOLO26_POSE = "models/yolo26m-pose.pt"
+MODEL_YOLO11_OBB = "models/yolo11s-obb.pt"
+MODEL_YOLO26_OBB = "models/yolo26s-obb.pt"
+MODEL_YOLO11_POSE = "models/yolo11s-pose.pt"
+MODEL_YOLO26_POSE = "models/yolo26s-pose.pt"
 NC_CUBE = 66
 NC_NORMAL = 95
 
@@ -69,12 +71,18 @@ class YOLONode(Node):
             if model_id == "yolo26":
                 path = MODEL_YOLO26
                 model_type = "AABB"
-            elif model_id == "cubified":
-                path = MODEL_CUBIFIED
-                model_type = "OBB"
             elif model_id == "yolo11":
                 path = MODEL_YOLO11
                 model_type = "AABB"
+            elif model_id == "cubified":
+                path = MODEL_CUBIFIED
+                model_type = "OBB"
+            elif model_id == "yolo26-obb":
+                path = MODEL_YOLO26_OBB
+                model_type = "OBB"
+            elif model_id == "yolo11-obb":
+                path = MODEL_YOLO11_OBB
+                model_type = "OBB"
             elif model_id == "yolo11-pose":
                 path = MODEL_YOLO11_POSE
                 model_type = "pose"
@@ -106,10 +114,16 @@ class YOLONode(Node):
 
         if model_id.startswith("["):
             self.model_ids = [m_id.strip() for m_id in model_id.strip('[]').split(',')]
-            model_types = [m_t.strip() for m_t in model_type.strip('[]').split(',')]
-            model_types.extend([model_types[-1] for _ in range(len(self.model_ids)-len(model_types))]) 
-            self.bb_trackers = [bb_t.strip() for bb_t in bb_tracker.strip('[]').split(',')]
-            self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids)-len(bb_tracker))]) 
+
+            raw_types = [t.strip() for t in model_type.strip('[]').split(',') if t.strip()]
+            model_types = raw_types if raw_types else []
+            if not model_types:
+                model_types = ['AABB']
+            model_types.extend([model_types[-1] for _ in range(len(self.model_ids) - len(model_types))])
+
+            raw_trackers = [t.strip() for t in bb_tracker.strip('[]').split(',') if t.strip()]
+            self.bb_trackers = raw_trackers if raw_trackers else ['bytetrack.yaml']
+            self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids) - len(self.bb_trackers))])
 
             # model fusion
             self.models = list()

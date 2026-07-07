@@ -22,7 +22,8 @@ echo "[run_yolo_node] Starting yolo_ros2 node..."
 # If first arg looks like a model shortcut (not a --ros-args flag), convert it
 if [ $# -gt 0 ] && [[ "$1" != "--ros-args" ]] && [[ "$1" != "-p" ]]; then
   echo "[run_yolo_node] Model: $1"
-  python3 -m yolo_ros2.yolo_node --ros-args -p model_id:="$@"
+  # YAML-single-quote the value so ROS2 doesn't parse [fusion, list] as STRING_ARRAY
+  python3 -m yolo_ros2.yolo_node --ros-args -p "model_id:='$1'"
 else
   python3 -m yolo_ros2.yolo_node "$@"
 fi
