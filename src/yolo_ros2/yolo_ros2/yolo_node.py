@@ -97,6 +97,7 @@ class YOLONode(Node):
             self.model_ids = model_id
             path, m_type = translate_model_id(model_id,model_type)
             self.model_types = m_type
+            self.bb_trackers = bb_tracker if bb_tracker else 'bytetrack.yaml'
             self.models = MoEYOLO(path,NC_NORMAL,NC_CUBE) if "MoE" in model_id else YOLO(path)
             self.models.to(device)
             self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
@@ -121,10 +122,8 @@ class YOLONode(Node):
 
         self.source_sub = self.create_subscription(
             String, "/camera/source_info", self.source_callback, 10)
-        self.depth_sub = self.create_subscription(
-            Image, "/camera/depth/image_raw", self.depth_callback, 10)
-        self.camera_info_sub = self.create_subscription(
-            CameraInfo, "/camera/camera_info", self.camera_info_callback, 10)
+        self._depth_sub = None
+        self._camera_info_sub = None
         self.image_sub = self.create_subscription(
             Image, "/camera/image_raw", self.image_callback, 10)
 
@@ -138,13 +137,33 @@ class YOLONode(Node):
             Image, "/yolo/debug_image", 10)
 
     def source_callback(self, msg):
-        self.camera_source = msg.data
+        new_source = msg.data
+        if new_source == self.camera_source:
+            return
+        self.camera_source = new_source
+        # Enable depth/CameraInfo only for realsense (has depth sensor)
+        if new_source == "realsense":
+            if self._depth_sub is None:
+                self._depth_sub = self.create_subscription(
+                    Image, "/camera/depth/image_raw", self._depth_callback, 10)
+            if self._camera_info_sub is None:
+                self._camera_info_sub = self.create_subscription(
+                    CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
+        else:
+            if self._depth_sub is not None:
+                self.destroy_subscription(self._depth_sub)
+                self._depth_sub = None
+                self.depth_image = None
+            if self._camera_info_sub is not None:
+                self.destroy_subscription(self._camera_info_sub)
+                self._camera_info_sub = None
+                self.camera_info = None
 
-    def depth_callback(self, msg):
+    def _depth_callback(self, msg):
         self.depth_image = self.bridge.imgmsg_to_cv2(
             msg, desired_encoding="passthrough")
 
-    def camera_info_callback(self, msg):
+    def _camera_info_callback(self, msg):
         self.camera_info = msg
 
     def project_3d(self, cx, cy):
@@ -171,14 +190,15 @@ class YOLONode(Node):
         return (X, Y, Z)
     
     # --- retrieve box preds ---
-    def _process_boxes(self, preds, m_id:str, model:YOLO, color:Tuple[int,int,int]):
+    def _process_boxes(self, preds, m_id:str, model:YOLO, color:Tuple[int,int,int]) -> list:
+        detections = []
         if hasattr(preds, 'obb') and preds.obb is not None:
             for obb in preds.obb:
                 conf = float(obb.conf[0])
                 if conf < self.conf_threshold: continue
                 xywhr = obb.xywhr[0].cpu().numpy()
                 cx, cy, w, h, angle_rad = xywhr
-                return {
+                detections.append({
                     'source': m_id,
                     'color': color,
                     'conf': conf,
@@ -190,13 +210,13 @@ class YOLONode(Node):
                     'w': w, 'h': h,
                     'angle_rad': angle_rad,
                     'track_id': int(obb.id[0]) if obb.id is not None else None,
-                }
+                })
         elif preds.boxes is not None:
             for box in preds.boxes:
                 conf = float(box.conf[0])
                 if conf < self.conf_threshold: continue
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                return {
+                detections.append({
                     'source': m_id,
                     'color': color,
                     'conf': conf,
@@ -208,8 +228,8 @@ class YOLONode(Node):
                     'w': x2 - x1, 'h': y2 - y1,
                     'angle_rad': None,
                     'track_id': int(box.id[0]) if box.id is not None else None,
-                }
-        raise NotImplementedError()
+                })
+        return detections
     
     # ----- fuse detections -----
     def _fuse_candidates(self, candidates):
@@ -341,16 +361,16 @@ class YOLONode(Node):
         if isinstance(self.models,list):
             predictions = [model.track(frame,persist=True, tracker=bb_tracker, conf=self.conf_threshold, verbose=False)[0] for model,bb_tracker in zip(self.models,self.bb_trackers)]
             candidates = []
-            for preds,m_id,model,color in zip(predictions, self.model_ids, self.models, self.colors): candidates.append(self._process_boxes(preds, m_id, model, color))
+            for preds,m_id,model,color in zip(predictions, self.model_ids, self.models, self.colors):
+                candidates.extend(self._process_boxes(preds, m_id, model, color))
             fused = self._fuse_candidates(candidates)
             for det in fused: self._publish(det, annotated, det2d_msg, det3d_msg, msg, now)
         else:
             preds = self.models.track(
                 frame, persist=True, tracker=self.bb_trackers,
                 conf=self.conf_threshold, verbose=False)[0]
-            # TODO: restructure code so that we use the same _process... functions in fused and also introduce supercategory coloring to single model
-            det = self._process_boxes(preds, m_id, model, color)
-            self._publish(det, annotated, det2d_msg, det3d_msg, msg, now)
+            for det in self._process_boxes(preds, self.model_ids, self.models, self.colors):
+                self._publish(det, annotated, det2d_msg, det3d_msg, msg, now)
 
         self.det2d_pub.publish(det2d_msg)
         if len(det3d_msg.detections) > 0:
