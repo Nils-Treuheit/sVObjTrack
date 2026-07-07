@@ -32,12 +32,34 @@ from random import randint
 
 
 # Default Fallback Models
-MODEL_YOLO11= "models/yolo11m.pt"
-MODEL_YOLO26= "models/yolo26m.pt"
+MODEL_YOLO11 = "models/yolo11m.pt"
+MODEL_YOLO26 = "models/yolo26m.pt"
 MODEL_CUBIFIED = "models/yolo_cubified.pt"
-# model naming convention: <descriptor/name>-<type>.pt -> example: yolo26-obb.pt
+MODEL_YOLO11_POSE = "models/yolo11m-pose.pt"
+MODEL_YOLO26_POSE = "models/yolo26m-pose.pt"
 NC_CUBE = 66
 NC_NORMAL = 95
+
+# COCO keypoint skeleton (17 keypoints)
+SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16)
+]
+KEYPOINT_COLORS = [
+    (255, 0, 0), (255, 0, 255), (0, 0, 255), (255, 0, 255), (0, 0, 255),
+    (255, 165, 0), (0, 255, 0), (255, 165, 0), (0, 255, 0),
+    (255, 165, 0), (0, 255, 0), (255, 0, 255), (0, 255, 255),
+    (255, 0, 255), (0, 255, 255), (255, 0, 255), (0, 255, 255)
+]
+SKELETON_COLORS = [
+    (255, 0, 0), (255, 0, 255), (255, 0, 0), (0, 0, 255),
+    (255, 165, 0), (255, 165, 0), (255, 165, 0), (0, 255, 0), (0, 255, 0),
+    (255, 0, 255), (0, 255, 255), (255, 0, 255),
+    (255, 0, 255), (0, 255, 255), (0, 255, 255), (0, 255, 255)
+]
+
 
 class YOLONode(Node):
     def __init__(self):
@@ -53,6 +75,12 @@ class YOLONode(Node):
             elif model_id == "yolo11":
                 path = MODEL_YOLO11
                 model_type = "AABB"
+            elif model_id == "yolo11-pose":
+                path = MODEL_YOLO11_POSE
+                model_type = "pose"
+            elif model_id == "yolo26-pose":
+                path = MODEL_YOLO26_POSE
+                model_type = "pose"
             elif model_id=="":
                 self.get_logger().warning(f"No model provided using YOLO26!")
                 path = MODEL_YOLO26
@@ -102,7 +130,6 @@ class YOLONode(Node):
             self.models.to(device)
             self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
         
-        # TODO: rename this into model color and add a super category coloring of boxes and add model_id to the label instead of current model based color coding
         self.colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)] 
         if isinstance(self.models,YOLO): self.colors = self.colors[0]
         elif len(self.colors)>len(self.models): self.colors = self.colors[:len(self.models)]
@@ -111,7 +138,13 @@ class YOLONode(Node):
             while len(self.colors)<len(self.models): self.colors.add((randint(0,255),randint(0,255),randint(0,255)))
             self.colors = list(self.colors)
 
-        self.is_obb = ("OBB" in self.model_types)
+        if isinstance(self.model_types, list):
+            self.is_obb = any(t == "OBB" for t in self.model_types)
+            self.is_pose = any(t == "pose" for t in self.model_types)
+        else:
+            self.is_obb = (self.model_types == "OBB")
+            self.is_pose = (self.model_types == "pose")
+
         self.bridge = CvBridge()
 
         self.camera_source = "unknown"
@@ -189,15 +222,52 @@ class YOLONode(Node):
         Z = depth_m
         return (X, Y, Z)
     
+    # --- draw keypoints on debug frame ---
+    def _draw_keypoints(self, annotated, keypoints, kpt_conf=None):
+        h, w = annotated.shape[:2]
+        vis_kpts = []
+        for i, (x, y) in enumerate(keypoints):
+            conf = kpt_conf[i] if kpt_conf is not None else 1.0
+            if conf < self.conf_threshold:
+                vis_kpts.append((None, None))
+                continue
+            px, py = int(x), int(y)
+            if px < 0 or px >= w or py < 0 or py >= h:
+                vis_kpts.append((None, None))
+                continue
+            color = KEYPOINT_COLORS[i] if i < len(KEYPOINT_COLORS) else (0, 255, 0)
+            cv2.circle(annotated, (px, py), 4, color, -1)
+            vis_kpts.append((px, py))
+
+        for si, (i, j) in enumerate(SKELETON):
+            if i >= len(vis_kpts) or j >= len(vis_kpts):
+                continue
+            p1 = vis_kpts[i]
+            p2 = vis_kpts[j]
+            if p1[0] is None or p2[0] is None:
+                continue
+            color = SKELETON_COLORS[si] if si < len(SKELETON_COLORS) else (0, 255, 0)
+            cv2.line(annotated, p1, p2, color, 2)
+
     # --- retrieve box preds ---
     def _process_boxes(self, preds, m_id:str, model:YOLO, color:Tuple[int,int,int]) -> list:
         detections = []
+        has_pose = hasattr(preds, 'keypoints') and preds.keypoints is not None
+
+        kpt_data = None
+        if has_pose:
+            kpt_xy = preds.keypoints.xy.cpu().numpy()  # (N, 17, 2)
+            kpt_c = preds.keypoints.conf.cpu().numpy() if preds.keypoints.conf is not None else None
+            kpt_data = (kpt_xy, kpt_c)
+
         if hasattr(preds, 'obb') and preds.obb is not None:
-            for obb in preds.obb:
+            for i, obb in enumerate(preds.obb):
                 conf = float(obb.conf[0])
                 if conf < self.conf_threshold: continue
                 xywhr = obb.xywhr[0].cpu().numpy()
                 cx, cy, w, h, angle_rad = xywhr
+                kpts = kpt_data[0][i] if kpt_data is not None else None
+                kpt_conf_i = kpt_data[1][i] if kpt_data is not None and kpt_data[1] is not None else None
                 detections.append({
                     'source': m_id,
                     'color': color,
@@ -210,12 +280,16 @@ class YOLONode(Node):
                     'w': w, 'h': h,
                     'angle_rad': angle_rad,
                     'track_id': int(obb.id[0]) if obb.id is not None else None,
+                    'keypoints': kpts,
+                    'kpt_conf': kpt_conf_i,
                 })
         elif preds.boxes is not None:
-            for box in preds.boxes:
+            for i, box in enumerate(preds.boxes):
                 conf = float(box.conf[0])
                 if conf < self.conf_threshold: continue
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                kpts = kpt_data[0][i] if kpt_data is not None else None
+                kpt_conf_i = kpt_data[1][i] if kpt_data is not None and kpt_data[1] is not None else None
                 detections.append({
                     'source': m_id,
                     'color': color,
@@ -228,27 +302,71 @@ class YOLONode(Node):
                     'w': x2 - x1, 'h': y2 - y1,
                     'angle_rad': None,
                     'track_id': int(box.id[0]) if box.id is not None else None,
+                    'keypoints': kpts,
+                    'kpt_conf': kpt_conf_i,
                 })
         return detections
     
-    # ----- fuse detections -----
+    # ----- fuse detections (multi-model NMS) -----
+    @staticmethod
+    def _overlap(a, b, iou_thresh=0.5):
+        inter_x1 = max(a['x1'], b['x1'])
+        inter_y1 = max(a['y1'], b['y1'])
+        inter_x2 = min(a['x2'], b['x2'])
+        inter_y2 = min(a['y2'], b['y2'])
+        if inter_x1 >= inter_x2 or inter_y1 >= inter_y2:
+            return False
+        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+        a_area = a['w'] * a['h']
+        b_area = b['w'] * b['h']
+        union = a_area + b_area - inter_area
+        if union <= 0:
+            return False
+        return (inter_area / union) >= iou_thresh
+
     def _fuse_candidates(self, candidates):
-        # TODO: use ciou, if boxes are likely pointing at same object (high ciou) - prefer the prediction with an angle unless the the other prediction has a confidence that is 0.33 higher than the obb
-        candidates.sort(key=lambda d: d['conf'], reverse=True)
         kept = []
-        for det in candidates:
-            match = False
-            for k in kept:
-                if det['cls_id'] != k['cls_id']:
+        assigned = [False] * len(candidates)
+
+        for i, det in enumerate(candidates):
+            if assigned[i]:
+                continue
+            group = [i]
+            assigned[i] = True
+            for j in range(i + 1, len(candidates)):
+                if assigned[j]:
                     continue
-                dist = math.hypot(det['cx'] - k['cx'], det['cy'] - k['cy'])
-                diag = max(math.hypot(det['w'], det['h']),
-                           math.hypot(k['w'], k['h']))
-                if dist < diag * 0.5:
-                    match = True
-                    break
-            if not match:
-                kept.append(det)
+                if det['cls_id'] != candidates[j]['cls_id']:
+                    continue
+                if self._overlap(det, candidates[j], iou_thresh=0.5):
+                    group.append(j)
+                    assigned[j] = True
+
+            group_dets = [candidates[idx] for idx in group]
+
+            obb_dets = [d for d in group_dets if d['angle_rad'] is not None]
+            aabb_dets = [d for d in group_dets if d['angle_rad'] is None and d.get('keypoints') is None]
+            pose_dets = [d for d in group_dets if d.get('keypoints') is not None]
+
+            # Box priority: OBB > AABB > pose-provided box
+            if obb_dets:
+                best = max(obb_dets, key=lambda d: d['conf'])
+            elif aabb_dets:
+                best = max(aabb_dets, key=lambda d: d['conf'])
+            elif pose_dets:
+                best = max(pose_dets, key=lambda d: d['conf'])
+            else:
+                continue
+
+            # Merge keypoints from the best pose detection (if any) into the kept box
+            if pose_dets:
+                best_pose = max(pose_dets, key=lambda d: d['conf'])
+                if best.get('keypoints') is None:
+                    best['keypoints'] = best_pose['keypoints']
+                    best['kpt_conf'] = best_pose.get('kpt_conf')
+
+            kept.append(best)
+
         return kept
     
     # ----- assign track ids -----
@@ -284,8 +402,15 @@ class YOLONode(Node):
         model_id = det['source']
         color = det['color'] # TODO: change color to super category color (in total 20 for COCO + DOTAv1 class categories + 1 called Cube for Cube Faces, read super category from some translation map)
         is_obb_result = (det['angle_rad'] is not None)
-        src_tag = "OBB" if is_obb_result else "AABB"
+        is_pose_result = (det.get('keypoints') is not None)
+        src_tag = "OBB" if is_obb_result else ("POSE" if is_pose_result else "AABB")
         track_id = self._assign_track_id(det, now)
+
+        # Draw keypoints if available
+        if is_pose_result and det['keypoints'] is not None:
+            kpts = det['keypoints']
+            kpt_conf = det.get('kpt_conf')
+            self._draw_keypoints(annotated, kpts, kpt_conf)
 
         point_3d = None
         if (self.camera_source == "realsense"
@@ -311,7 +436,6 @@ class YOLONode(Node):
             label += f" ID:{track_id}"
         if point_3d:
             label += f" Z:{point_3d[2]:.2f}m"
-        # TODO: add model id to label
 
         lx = int(cx - det['w'] / 2)
         ly = max(20, int(cy - det['h'] / 2 - 5))
@@ -394,4 +518,9 @@ if __name__ == "__main__":
 
 # ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=cubified
 # ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=yolo11
-# ros2 run yolo_ros2 yolo_node --ros-args -p model_type:=fusion
+# ros2 run yolo_ros2 yolo_node --ros-args -p model_id:=yolo11-pose
+# ros2 run yolo_ros2 yolo_node --ros-args -p model_id:=yolo26-pose
+# Fusion: AABB + OBB
+#   ros2 run yolo_ros2 yolo_node --ros-args -p model_id:="[yolo26, cubified]" -p model_type:="[AABB, OBB]"
+# Fusion: AABB + OBB + Pose
+#   ros2 run yolo_ros2 yolo_node --ros-args -p model_id:="[yolo26, cubified, yolo11-pose]" -p model_type:="[AABB, OBB, pose]"

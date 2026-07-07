@@ -15,6 +15,8 @@ Topics:
   Published:
     /la/debug_image         (sensor_msgs/Image)   - Annotated frames
     /la/detections_2d       (vision_msgs/Detection2DArray) - Bounding boxes
+    /la/detections_3d       (vision_msgs/Detection3DArray) - 3D detections (with depth)
+    /la/object_point        (geometry_msgs/PointStamped)   - 3D center point
     /la/grounding_text      (std_msgs/String)     - Visual grounding results
 
 Detection queries run in a round-robin cycle. Each query runs LA on one frame,
@@ -33,7 +35,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import String
-from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
+from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose, Detection3DArray, Detection3D
 from geometry_msgs.msg import PointStamped
 import cv2
 import numpy as np
@@ -149,11 +151,16 @@ class LocateAnythingROS2(Node):
         self.query_idx = 0
         self.lock = threading.Lock()
 
+        self.depth_image = None
+        self.camera_info = None
+
         # Detection cache: persists between LA inference runs
         self.detections = []
         self.track_history = OrderedDict()
         self._next_track_id = 1
         self.last_inference_time = 0.0
+        self.last_query_type = 'detect'
+        self.last_query_label = ''
 
         # LA model (lazy-loaded)
         self.la = None
@@ -170,10 +177,14 @@ class LocateAnythingROS2(Node):
             Image, '/camera/image_raw', self.image_callback, 10)
         self.grounding_sub = self.create_subscription(
             String, '/la/grounding_query', self.grounding_callback, 10)
+        self._depth_sub = None
+        self._camera_info_sub = None
 
         # Publishers
         self.image_pub = self.create_publisher(Image, '/la/debug_image', 10)
         self.det2d_pub = self.create_publisher(Detection2DArray, '/la/detections_2d', 10)
+        self.det3d_pub = self.create_publisher(Detection3DArray, '/la/detections_3d', 10)
+        self.point_pub = self.create_publisher(PointStamped, '/la/object_point', 10)
         self.grounding_pub = self.create_publisher(String, '/la/grounding_text', 10)
 
         # Load model in background
@@ -212,7 +223,56 @@ class LocateAnythingROS2(Node):
         thread.start()
 
     def source_callback(self, msg):
-        self.camera_source = msg.data
+        new_source = msg.data
+        if new_source == self.camera_source:
+            return
+        self.camera_source = new_source
+        if new_source == "realsense":
+            if self._depth_sub is None:
+                self._depth_sub = self.create_subscription(
+                    Image, "/camera/depth/image_raw", self._depth_callback, 10)
+            if self._camera_info_sub is None:
+                self._camera_info_sub = self.create_subscription(
+                    CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
+        else:
+            if self._depth_sub is not None:
+                self.destroy_subscription(self._depth_sub)
+                self._depth_sub = None
+                self.depth_image = None
+            if self._camera_info_sub is not None:
+                self.destroy_subscription(self._camera_info_sub)
+                self._camera_info_sub = None
+                self.camera_info = None
+
+    def _depth_callback(self, msg):
+        self.depth_image = self.bridge.imgmsg_to_cv2(
+            msg, desired_encoding="passthrough")
+
+    def _camera_info_callback(self, msg):
+        self.camera_info = msg
+
+    def project_3d(self, cx, cy):
+        if self.depth_image is None or self.camera_info is None:
+            return None
+        h, w = self.depth_image.shape[:2]
+        px, py = int(cx), int(cy)
+        if px < 0 or px >= w or py < 0 or py >= h:
+            return None
+        depth = self.depth_image[py, px]
+        if self.depth_image.dtype == np.uint16:
+            depth_m = float(depth) / 1000.0
+        else:
+            depth_m = float(depth)
+        if np.isnan(depth_m) or np.isinf(depth_m) or depth_m <= 0:
+            return None
+        fx = self.camera_info.k[0]
+        fy = self.camera_info.k[4]
+        cx0 = self.camera_info.k[2]
+        cy0 = self.camera_info.k[5]
+        X = (cx - cx0) * depth_m / fx
+        Y = (cy - cy0) * depth_m / fy
+        Z = depth_m
+        return (X, Y, Z)
 
     def grounding_callback(self, msg):
         """Handle ad-hoc visual grounding query via topic."""
@@ -234,6 +294,7 @@ class LocateAnythingROS2(Node):
                                   max_new_tokens=self.max_new_tokens, temperature=0)
             elapsed = (time.time() - t0) * 1000
             boxes = parse_boxes(text)
+            task_type = classify_query(query)
 
             result = f'[LA Grounding] Query: "{query}"\n{text}\n'
             if boxes:
@@ -263,7 +324,10 @@ class LocateAnythingROS2(Node):
                         'h': (b[3] - b[1]) * h if len(b) == 4 else 0,
                         'angle_rad': None,
                         'color': (0, 255, 255),
+                        'pose_text': text if task_type == 'pose' else None,
                     } for b in boxes]
+                    self.last_query_label = query
+                    self.last_query_type = task_type
         except Exception as e:
             self.get_logger().error(f'Grounding failed: {e}')
 
@@ -275,6 +339,9 @@ class LocateAnythingROS2(Node):
         # Pick the next query in round-robin
         query = self.detect_queries[self.query_idx % len(self.detect_queries)]
         self.query_idx += 1
+        task_type = classify_query(query)
+        self.last_query_type = task_type
+        self.last_query_label = query
 
         try:
             pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -309,6 +376,7 @@ class LocateAnythingROS2(Node):
                     'h': y2 - y1,
                     'angle_rad': None,
                     'color': (0, 255, 0),
+                    'pose_text': text if task_type == 'pose' else None,
                 })
 
             # Assign track IDs
@@ -322,7 +390,7 @@ class LocateAnythingROS2(Node):
             if self.debug_mode:
                 self.get_logger().info(
                     f'[LA] "{query}": {len(boxes)} boxes in {elapsed:.0f}ms, '
-                    f'frame {self.frame_count}')
+                    f'frame {self.frame_count}, type={task_type}')
 
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')
@@ -347,7 +415,7 @@ class LocateAnythingROS2(Node):
             return new_id
 
     def _draw_detections(self, annotated, detections):
-        """Draw bounding boxes and labels on the frame."""
+        """Draw bounding boxes, labels, and pose text on the frame."""
         for det in detections:
             x1, y1, x2, y2 = map(int, [det['x1'], det['y1'], det['x2'], det['y2']])
             color = det.get('color', (0, 255, 0))
@@ -363,10 +431,26 @@ class LocateAnythingROS2(Node):
             cv2.putText(annotated, label, (lx, ly),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+            # Draw pose description text below the box
+            pose_text = det.get('pose_text')
+            if pose_text:
+                pose_lines = pose_text.split('.')[:2]  # first 2 sentences max
+                for li, line in enumerate(pose_lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ty = y2 + 15 + li * 14
+                    if ty > annotated.shape[0] - 10:
+                        break
+                    cv2.putText(annotated, line[:50], (x1, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
     def _publish_detections(self, detections, header):
-        """Publish detection results as vision_msgs/Detection2DArray."""
+        """Publish detection results as vision_msgs messages."""
         det2d_msg = Detection2DArray()
         det2d_msg.header = header
+        det3d_msg = Detection3DArray()
+        det3d_msg.header = header
 
         for det in detections:
             d2d = Detection2D()
@@ -374,9 +458,47 @@ class LocateAnythingROS2(Node):
             d2d.bbox.center.position.y = float(det['cy'])
             d2d.bbox.size_x = float(det['w'])
             d2d.bbox.size_y = float(det['h'])
+
+            hyp = ObjectHypothesisWithPose()
+            hyp.hypothesis.class_id = det['class_name']
+            hyp.hypothesis.score = det.get('conf', 1.0)
+
+            # Store pose text in the pose field if available
+            pose_text = det.get('pose_text')
+            if pose_text:
+                # Encode pose text into orientation as simple flag
+                hyp.pose.pose.position.z = 1.0  # marker for pose result
+
+            d2d.results.append(hyp)
             det2d_msg.detections.append(d2d)
 
+            # 3D projection when depth available
+            point_3d = None
+            if (self.camera_source == "realsense"
+                    and self.depth_image is not None
+                    and self.camera_info is not None):
+                point_3d = self.project_3d(det['cx'], det['cy'])
+
+            if point_3d:
+                pt = PointStamped()
+                pt.header = header
+                pt.point.x, pt.point.y, pt.point.z = point_3d
+                self.point_pub.publish(pt)
+
+                d3d = Detection3D()
+                d3d.bbox.center.position.x = point_3d[0]
+                d3d.bbox.center.position.y = point_3d[1]
+                d3d.bbox.center.position.z = point_3d[2]
+
+                d3d_hyp = ObjectHypothesisWithPose()
+                d3d_hyp.hypothesis.class_id = det['class_name']
+                d3d_hyp.hypothesis.score = det.get('conf', 1.0)
+                d3d.results.append(d3d_hyp)
+                det3d_msg.detections.append(d3d)
+
         self.det2d_pub.publish(det2d_msg)
+        if len(det3d_msg.detections) > 0:
+            self.det3d_pub.publish(det3d_msg)
 
     def image_callback(self, msg: Image):
         """Main image processing callback."""
@@ -400,16 +522,16 @@ class LocateAnythingROS2(Node):
             self._draw_detections(annotated, active_dets)
             self._publish_detections(active_dets, msg.header)
 
+        # Show inference overlay
+        if self.last_inference_time > 0:
+            status = f'LA: {self.last_inference_time:.0f}ms | {len(active_dets)} tracked | {self.last_query_label}'
+            cv2.putText(annotated, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
         # Publish debug image
         debug_msg = self.bridge.cv2_to_imgmsg(annotated, encoding='bgr8')
         debug_msg.header = msg.header
         self.image_pub.publish(debug_msg)
-
-        # Show inference overlay
-        if self.last_inference_time > 0:
-            status = f'LA: {self.last_inference_time:.0f}ms | {len(active_dets)} tracked'
-            cv2.putText(annotated, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def destroy_node(self):
         super().destroy_node()
