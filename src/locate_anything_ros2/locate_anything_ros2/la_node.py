@@ -23,13 +23,12 @@ Detection queries run in a round-robin cycle. Each query runs LA on one frame,
 results persist for subsequent frames until the next cycle updates them.
 """
 import sys
-import os
 import time
 import math
 import re
 import threading
 from pathlib import Path
-from collections import OrderedDict
+from types import SimpleNamespace
 
 import rclpy
 from rclpy.node import Node
@@ -41,6 +40,8 @@ import cv2
 import numpy as np
 import json
 from PIL import Image as PILImage
+
+from ultralytics.trackers import BYTETracker
 
 # cv_bridge may fail under numpy 2.x; guard both import and instantiation
 _CV_BRIDGE_OK = False
@@ -109,6 +110,47 @@ def parse_detections(text: str) -> list:
 
         results.append((label, coords))
     return results
+
+
+CLASS_COLORS = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255),
+    (0, 255, 255), (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0),
+    (128, 0, 128), (0, 128, 128), (192, 128, 0), (128, 192, 0), (0, 192, 128),
+    (128, 0, 192), (192, 0, 128), (0, 128, 192), (64, 64, 255), (255, 64, 64),
+    (64, 255, 64), (192, 64, 64), (64, 192, 64), (64, 64, 192), (255, 128, 0),
+    (128, 255, 0), (0, 255, 128), (128, 0, 255), (255, 0, 128), (0, 128, 255),
+]
+
+
+def class_color(name: str) -> tuple:
+    h = hash(name)
+    return CLASS_COLORS[h % len(CLASS_COLORS)]
+
+
+def box_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
+
+
+class _DetectionResults:
+    """Minimal results-like wrapper for BYTETracker.update()."""
+    def __init__(self, xywh, conf, cls):
+        self.xywh = np.asarray(xywh, dtype=np.float32).reshape(-1, 4)
+        self.conf = np.asarray(conf, dtype=np.float32)
+        self.cls = np.asarray(cls, dtype=np.float32)
+
+    def __getitem__(self, idx):
+        return _DetectionResults(self.xywh[idx], self.conf[idx], self.cls[idx])
+
+    def __len__(self):
+        return len(self.conf)
 
 
 def classify_query(query: str) -> str:
@@ -182,6 +224,7 @@ class LocateAnythingROS2(Node):
         self.declare_parameter('max_new_tokens', 128)
         self.declare_parameter('grounding_max_new_tokens', 1024)
         self.declare_parameter('debug', True)
+        self.declare_parameter('query_only', False)
 
         objects_file = self.get_parameter('objects_file').value
         self.detect_objects = load_objects(objects_file)
@@ -190,6 +233,7 @@ class LocateAnythingROS2(Node):
         self.max_new_tokens = self.get_parameter('max_new_tokens').value
         self.grounding_max_new_tokens = self.get_parameter('grounding_max_new_tokens').value
         self.debug_mode = self.get_parameter('debug').value
+        self.query_only = self.get_parameter('query_only').value
 
         if _CV_BRIDGE_OK:
             self.bridge = CvBridge()
@@ -208,11 +252,21 @@ class LocateAnythingROS2(Node):
 
         # Detection cache: persists between LA inference runs
         self.detections = []
-        self.track_history = OrderedDict()
-        self._next_track_id = 1
+        self.frame_history = []
         self.last_inference_time = 0.0
         self.last_query_type = 'detect'
         self.last_query_label = ''
+
+        # ByteTrack
+        tracker_cfg = SimpleNamespace(
+            track_high_thresh=0.25,
+            track_low_thresh=0.1,
+            new_track_thresh=0.25,
+            track_buffer=30,
+            match_thresh=0.8,
+            fuse_score=True,
+        )
+        self.tracker = BYTETracker(tracker_cfg)
 
         # LA model (lazy-loaded)
         self.la = None
@@ -234,10 +288,11 @@ class LocateAnythingROS2(Node):
 
         # Publishers
         self.image_pub = self.create_publisher(Image, '/la/debug_image', 10)
-        self.det2d_pub = self.create_publisher(Detection2DArray, '/la/detections_2d', 10)
-        self.det3d_pub = self.create_publisher(Detection3DArray, '/la/detections_3d', 10)
-        self.point_pub = self.create_publisher(PointStamped, '/la/object_point', 10)
         self.grounding_pub = self.create_publisher(String, '/la/grounding_text', 10)
+        if not self.query_only:
+            self.det2d_pub = self.create_publisher(Detection2DArray, '/la/detections_2d', 10)
+            self.det3d_pub = self.create_publisher(Detection3DArray, '/la/detections_3d', 10)
+            self.point_pub = self.create_publisher(PointStamped, '/la/object_point', 10)
 
         # Load model in background
         self._load_model_async()
@@ -384,25 +439,57 @@ class LocateAnythingROS2(Node):
         except Exception as e:
             self.get_logger().error(f'Grounding failed: {e}')
 
-    def _build_detection_query(self) -> str:
-        """Build single comprehensive query with previous-frame context."""
-        items = ", ".join(self.detect_objects)
-        query = f"Detect all of the following in this scene: {items}. For each one output <box>x1,y1,x2,y2</box> class_name."
+    def _deduplicate_history(self, history):
+        """Flatten frame_history and keep newest box per (label, high-IoU) group."""
+        all_dets = []
+        for frame_idx, frame_dets in enumerate(history):
+            for d in frame_dets:
+                d_copy = dict(d)
+                d_copy['_frame_idx'] = frame_idx
+                all_dets.append(d_copy)
+        all_dets.sort(key=lambda x: x['_frame_idx'], reverse=True)
+        kept = []
+        for d in all_dets:
+            cn = d['class_name']
+            box = (d['x1'], d['y1'], d['x2'], d['y2'])
+            dup = False
+            for k in kept:
+                if k['class_name'] == cn and box_iou(box, (k['x1'], k['y1'], k['x2'], k['y2'])) > 0.5:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(d)
+        return kept[:20]
 
-        # Prepend previous frame's detections as context (from 2nd query onward)
+    def _build_detection_query(self, mode='dict') -> str:
+        """Build detection query with deduplicated context.
+        
+        mode='dict': lists all known classes (reliable named detections).
+        mode='open': detects any object (catches things not in the dictionary).
+        """
+        if mode == 'dict':
+            items = ", ".join(self.detect_objects)
+            query = f"Detect all of the following in this scene: {items}. For each one output <box>x1,y1,x2,y2</box> class_name."
+        else:
+            query = "Detect all objects in this scene. For each one output <box>x1,y1,x2,y2</box> class_name."
+
         with self.lock:
-            prev = list(self.detections)
+            history = list(self.frame_history)
+
+        if not history:
+            return query
+
+        prev = self._deduplicate_history(history)
         if not prev:
             return query
 
         ctx_parts = []
-        h, w = 480, 640  # fallback — will be updated if we have a frame
+        h, w = 480, 640
         if self.latest_frame is not None:
             h, w = self.latest_frame.shape[:2]
-        for d in prev[:20]:  # limit to 20 objects
+        for d in prev[:20]:
             tid = d.get('track_id')
             cn = d['class_name']
-            # Convert pixel coords back to LA token format [0,1000] for the prompt
             nx1 = int((d['x1'] / w) * 1000) if w else 0
             ny1 = int((d['y1'] / h) * 1000) if h else 0
             nx2 = int((d['x2'] / w) * 1000) if w else 0
@@ -412,92 +499,133 @@ class LocateAnythingROS2(Node):
         ctx = ", ".join(ctx_parts)
         return f"Previously detected: {ctx}. {query}"
 
+    def _boxes_from_parsed(self, parsed, h, w):
+        """Convert (label, [x1,y1,x2,y2]) from parse_detections into box dicts."""
+        dets = []
+        for label, b in parsed:
+            if len(b) == 4:
+                x1 = (b[0] / 1000.0) * w
+                y1 = (b[1] / 1000.0) * h
+                x2 = (b[2] / 1000.0) * w
+                y2 = (b[3] / 1000.0) * h
+            elif len(b) == 2:
+                cx = (b[0] / 1000.0) * w
+                cy = (b[1] / 1000.0) * h
+                x1, y1, x2, y2 = cx - 10, cy - 10, cx + 10, cy + 10
+            else:
+                continue
+            dets.append({
+                'source': 'detect', 'class_name': label, 'conf': 1.0,
+                'cx': (x1 + x2) / 2.0, 'cy': (y1 + y2) / 2.0,
+                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                'w': x2 - x1, 'h': y2 - y1,
+                'angle_rad': None, 'color': (0, 255, 0),
+            })
+        return dets
+
+    @staticmethod
+    def _filter_garbage(dets, img_area):
+        """Remove full-frame and generic-label detections."""
+        clean = []
+        for d in dets:
+            if d['w'] * d['h'] / img_area > 0.9:
+                continue
+            cn = d['class_name']
+            if re.match(r'^class\s+\d+$', cn, re.I) or cn.strip().isdigit():
+                continue
+            clean.append(d)
+        return clean
+
+    @staticmethod
+    def _is_same_object(a, b):
+        """Check if two detections likely refer to the same object."""
+        if a['class_name'].lower() == b['class_name'].lower():
+            return True
+        if math.hypot(a['cx'] - b['cx'], a['cy'] - b['cy']) < 50:
+            return True
+        if box_iou((a['x1'], a['y1'], a['x2'], a['y2']),
+                   (b['x1'], b['y1'], b['x2'], b['y2'])) > 0.3:
+            return True
+        return False
+
+    def _merge_novel(self, dict_dets, open_dets):
+        """Dict results keep all; open results only keep non-overlapping objects."""
+        merged = list(dict_dets)
+        for od in open_dets:
+            if not any(self._is_same_object(od, dd) for dd in dict_dets):
+                merged.append(od)
+        return merged
+
     def _run_detection(self, frame, header):
-        """Run LA detection — one query lists all objects, replaces previous detections."""
+        """Run LA detection — parallel dict + open queries merged."""
         if self.la is None:
             return
 
-        query = self._build_detection_query()
-        self.last_query_label = query[:80]
-
         try:
             pil_img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            t0 = time.time()
-            text = self.la.ground(pil_img, query,
-                                  max_new_tokens=self.max_new_tokens, temperature=0)
-            elapsed = (time.time() - t0) * 1000
-            self.last_inference_time = elapsed
-            dets = parse_detections(text)
-
-            new_dets = []
             h, w = frame.shape[:2]
-            for label, b in dets:
-                if len(b) == 4:
-                    x1, y1, x2, y2 = b
-                    x1 = (x1 / 1000.0) * w
-                    y1 = (y1 / 1000.0) * h
-                    x2 = (x2 / 1000.0) * w
-                    y2 = (y2 / 1000.0) * h
-                elif len(b) == 2:
-                    cx = (b[0] / 1000.0) * w
-                    cy = (b[1] / 1000.0) * h
-                    x1, y1, x2, y2 = cx - 10, cy - 10, cx + 10, cy + 10
-                else:
-                    continue
-                new_dets.append({
-                    'source': 'detect',
-                    'class_name': label,
-                    'conf': 1.0,
-                    'cx': (x1 + x2) / 2.0,
-                    'cy': (y1 + y2) / 2.0,
-                    'x1': x1, 'y1': y1,
-                    'x2': x2, 'y2': y2,
-                    'w': x2 - x1,
-                    'h': y2 - y1,
-                    'angle_rad': None,
-                    'color': (0, 255, 0),
-                })
+            img_area = float(h * w) if h and w else 1.0
 
-            now = time.time()
-            for det in new_dets:
-                det['track_id'] = self._assign_track_id(det, now)
+            # --- 1. Dictionary query (reliable named classes) ---
+            q1 = self._build_detection_query('dict')
+            self.last_query_label = q1[:80]
+            t0 = time.time()
+            text1 = self.la.ground(pil_img, q1,
+                                   max_new_tokens=self.max_new_tokens, temperature=0)
+            elapsed1 = (time.time() - t0) * 1000
+            dict_dets = self._filter_garbage(
+                self._boxes_from_parsed(parse_detections(text1), h, w), img_area)
+
+            # --- 2. Open query (catches objects not in the dictionary) ---
+            q2 = self._build_detection_query('open')
+            t0 = time.time()
+            text2 = self.la.ground(pil_img, q2,
+                                   max_new_tokens=self.max_new_tokens, temperature=0)
+            elapsed2 = (time.time() - t0) * 1000
+            open_dets = self._filter_garbage(
+                self._boxes_from_parsed(parse_detections(text2), h, w), img_area)
+
+            # --- 3. Merge: dict takes priority, open adds novel objects ---
+            new_dets = self._merge_novel(dict_dets, open_dets)
+            elapsed = elapsed1 + elapsed2
+            self.last_inference_time = elapsed
+
+            # --- 4. ByteTrack on merged detections ---
+            xywh = np.array([[d['cx'], d['cy'], d['w'], d['h']] for d in new_dets], dtype=np.float32) if new_dets else np.empty((0, 4))
+            conf = np.ones(len(new_dets), dtype=np.float32) if new_dets else np.empty(0)
+            cls_ids = np.array([hash(d['class_name']) for d in new_dets], dtype=np.float32) if new_dets else np.empty(0)
+            results = _DetectionResults(xywh, conf, cls_ids)
+            tracks = self.tracker.update(results)
+            track_map = {}
+            if len(tracks):
+                for row in tracks:
+                    tid = int(row[4])
+                    cls_idx = float(row[6])
+                    for i, d in enumerate(new_dets):
+                        if abs(cls_ids[i] - cls_idx) < 0.1 and tid not in track_map:
+                            track_map[i] = tid
+                            break
+            for i, d in enumerate(new_dets):
+                d['track_id'] = track_map.get(i)
 
             with self.lock:
                 self.detections = new_dets
+                if new_dets:
+                    self.frame_history.append(list(new_dets))
+                    if len(self.frame_history) > 5:
+                        self.frame_history.pop(0)
+
+            # Terminal status line via stderr
+            parts = [f"{d['class_name']} ({int(d['cx'])},{int(d['cy'])})" for d in new_dets]
+            sys.stderr.write('\033[2K\r' + '  '.join(parts) + '\033[K')
 
             if self.debug_mode:
                 self.get_logger().info(
-                    f'[LA] detection: {len(new_dets)} boxes in {elapsed:.0f}ms, '
-                    f'frame {self.frame_count}')
+                    f'[LA] dict:{len(dict_dets)} open:{len(open_dets)} merged:{len(new_dets)} '
+                    f'boxes in {elapsed:.0f}ms ({elapsed1:.0f}+{elapsed2:.0f}), frame {self.frame_count}')
 
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')
-
-    def _assign_track_id(self, det, now):
-        """Simple nearest-neighbor track ID assignment with stale cleanup."""
-        cx, cy = det['cx'], det['cy']
-        best_id = None
-        best_dist = 200.0
-        stale_cutoff = now - 5.0
-        stale_ids = []
-        for tid, (tcx, tcy, tt) in list(self.track_history.items()):
-            if tt < stale_cutoff:
-                stale_ids.append(tid)
-                continue
-            d = math.hypot(cx - tcx, cy - tcy)
-            if d < best_dist:
-                best_dist = d
-                best_id = tid
-        for sid in stale_ids:
-            del self.track_history[sid]
-        if best_id is not None:
-            self.track_history[best_id] = (cx, cy, now)
-            return best_id
-        else:
-            new_id = self._next_track_id
-            self._next_track_id += 1
-            self.track_history[new_id] = (cx, cy, now)
-            return new_id
 
     def _draw_detections(self, annotated, detections):
         """Draw bounding boxes and YOLO-style labels on the frame."""
@@ -508,33 +636,27 @@ class LocateAnythingROS2(Node):
             y1 = max(0, min(y1, h_img - 1))
             x2 = max(0, min(x2, w_img - 1))
             y2 = max(0, min(y2, h_img - 1))
-            color = det.get('color', (0, 255, 0))
-
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-            # Center point (LA point-mode style)
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            cv2.circle(annotated, (cx, cy), radius=5, color=(0, 0, 255), thickness=-1)
 
             class_name = det['class_name']
+            color = class_color(class_name)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
             conf = det.get('conf', 1.0)
             track_id = det.get('track_id')
             w = x2 - x1
             h = y2 - y1
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
 
-            # Match YOLO label format: class conf [TYPE] ID:id Z:zm
             label = f'{class_name} {conf:.2f} [AABB]'
             if track_id is not None:
                 label += f' ID:{track_id}'
 
-            # Add Z distance when depth available
             if self.camera_source == "realsense" and self.depth_image is not None and self.camera_info is not None:
                 pt3d = self.project_3d(cx, cy)
                 if pt3d:
                     label += f' Z:{pt3d[2]:.2f}m'
 
-            # Top-center label position (matches YOLO)
             lx = int(cx - w / 2)
             ly = max(20, int(cy - h / 2 - 5))
             cv2.putText(annotated, label, (lx, ly),
@@ -597,16 +719,17 @@ class LocateAnythingROS2(Node):
         self.latest_msg_header = msg.header
         self.frame_count += 1
 
-        # Run detection every N frames
-        if (self.frame_count % self.interval_frames == 0
-                and self.la is not None):
-            self._run_detection(frame.copy(), msg.header)
+        # Run detection every N frames (skip in query-only mode)
+        if not self.query_only:
+            if (self.frame_count % self.interval_frames == 0
+                    and self.la is not None):
+                self._run_detection(frame.copy(), msg.header)
 
         # Build annotated frame
         annotated = frame.copy()
         with self.lock:
             active_dets = list(self.detections)
-        if active_dets:
+        if active_dets and not self.query_only:
             self._draw_detections(annotated, active_dets)
             self._publish_detections(active_dets, msg.header)
 

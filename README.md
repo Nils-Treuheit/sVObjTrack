@@ -15,22 +15,12 @@ ros2 run camera_nodes realsense_camera    # Intel RealSense (publishes depth + c
 # or launch with arg (0=USB, 1=RealSense):
 ros2 launch camera_nodes cameras.launch.py 0
 
-# Terminal 2: YOLO detection (AABB / OBB / Pose + multi-object tracking)
-./run_yolo_node.sh                     # default: YOLO26 AABB
-./run_yolo_node.sh yolo11              # YOLO11
-./run_yolo_node.sh cubified            # Oriented bounding boxes
-./run_yolo_node.sh yolo11-pose         # YOLO11 pose/keypoint estimation
-./run_yolo_node.sh yolo26-pose         # YOLO26 pose/keypoint estimation
+# Terminal 2: Orchestrator — manages YOLO + LA internally
+./run_orchestrator_node.sh                          # default: yolo26 + yolo26-obb + yolo26-pose
+./run_orchestrator_node.sh yolo11                   # single model
+./run_orchestrator_node.sh '[yolo26, cubified]'     # custom fusion
 
-# YOLO model fusion (multiple models, NMS across outputs)
-./run_yolo_node.sh '[yolo26, cubified]'           # AABB + OBB fusion
-./run_yolo_node.sh '[yolo26, yolo11-pose]'        # AABB + pose fusion
-./run_yolo_node.sh '[yolo26, cubified, yolo11-pose]'  # AABB + OBB + pose fusion
-
-# Terminal 3: LocateAnything per-class object detection (TRT-accelerated)
-./run_la_node.sh
-
-# Terminal 4: Watch detections
+# Terminal 3: Watch detections
 ros2 run rqt_image_view rqt_image_view
 ```
 
@@ -58,8 +48,9 @@ Launchers activate the sVObjTrack venv first to ensure numpy 1.x (required
 for cv_bridge ABI compatibility) and to set up the TRT library path.
 
 ### `run_la_node.sh`
-Activates venv + ROS2 + sets `LD_LIBRARY_PATH` for TRT. Runs
-LocateAnything-3B with vision encoder via TensorRT EP (~10ms/frame).
+Standalone LA node (for debugging). Normally managed by the orchestrator
+in query-only mode. Activates venv + ROS2 + sets `LD_LIBRARY_PATH` for TRT.
+Runs LocateAnything-3B with vision encoder via TensorRT EP (~10ms/frame).
 Subscribes to `/camera/image_raw`, cycles through object classes from
 `config/la_objects.json` (one class per `interval_frames`), drawing
 bounding boxes with class labels on `/la/debug_image` and publishing
@@ -69,6 +60,11 @@ structured detections to `/la/detections_2d` and `/la/detections_3d`
 
 ```
 ./run_la_node.sh
+```
+
+To run in query-only mode (no detection cycle):
+```bash
+./run_la_node.sh --ros-args -p query_only:=True
 ```
 
 To use a custom object list:
@@ -109,6 +105,40 @@ GUI-style (pointing / clicking):
 ./run_la_grounding.sh "click the red icon in the top right"
 ./run_la_grounding.sh "point to the settings menu"
 ```
+
+### `run_orchestrator_node.sh`
+Manages both YOLO detection and LocateAnything as internal subprocesses.
+YOLO runs continuous online detection (default fusion: `[yolo26, yolo26-obb,
+yolo26-pose]`). LA runs in **query-only mode** (no detection cycle) — it
+only responds to text queries on `/la/grounding_query`. Listens for queries
+on `/orchestrator/query`.
+
+Query with the Python wrapper:
+
+```bash
+# Terminal 1: start orchestrator (manages YOLO + LA internally)
+./run_orchestrator_node.sh                          # default fusion
+./run_orchestrator_node.sh yolo11                   # single model override
+./run_orchestrator_node.sh '[yolo26, cubified]'     # custom fusion override
+
+# Terminal 2: query it
+./run_orchestrator_query.sh "how many people are in the scene?"
+./run_orchestrator_query.sh "find the red cup"
+./run_orchestrator_query.sh "read the text on the cube"
+./run_orchestrator_query.sh "select the cube with a 2"
+./run_orchestrator_query.sh "plant closest to the person"
+```
+
+The orchestrator forwards the query to `/la/grounding_query`, waits for LA's
+response on `/la/grounding_text`, and publishes the enriched result (LA answer
++ YOLO scene count) to `/orchestrator/response`.
+
+Model selection works the same as `run_yolo_node.sh` (single shortcut or
+`[model_a, model_b, ...]` fusion list). Both subprocesses are killed on
+orchestrator shutdown.
+
+See `run_la_grounding.sh` for more query patterns (referring, relational,
+OCR, GUI-style).
 
 ### `run_yolo_node.sh`
 Same environment for YOLO detection (11/26, pose). Multi-object tracking via
@@ -175,11 +205,14 @@ VLM:
 | `/la/object_point` | `geometry_msgs/PointStamped` | LA 3D center point | la_node |
 | `/la/grounding_text` | `std_msgs/String` | LA visual grounding results | la_node |
 | `/la/grounding_query` | `std_msgs/String` | Ad-hoc grounding query (input) | any node |
+| `/orchestrator/query` | `std_msgs/String` | Text query to orchestrator (input) | any node |
+| `/orchestrator/response` | `std_msgs/String` | Enriched LA query response | orchestrator_node |
 
 Each topic only exists when its publishing node is loaded:
 - YOLO topics are dead when no `yolo_node` is running
 - LA topics are dead when no `la_node` is running
 - 3D topics are dead with USB camera (no depth source)
+- Orchestrator topics are dead when no `orchestrator_node` is running
 
 ## Parameters
 
@@ -245,7 +278,7 @@ In fusion mode, each model can use a different tracker:
   advertise depth topics.
 - **Multi-object tracking**: YOLO returns all detections above threshold;
   each gets a persistent track ID via centroid nearest-neighbor matching.
-- **LA detection & grounding**: Separate pipelines. **Detection** runs a single comprehensive query listing all objects from `config/la_objects.json` — one inference every `interval_frames` returns all object types at once. **Grounding** runs on-demand via `/la/grounding_query` and publishes free-text results to `/la/grounding_text`. Each detection query replaces the previous frame's detections entirely.
+- **Architecture**: YOLO nodes handle real-time online detection (AABB, OBB, pose). The LA node serves as a **query engine** for grounding, counting, OCR, and text-driven object selection — running inference only when queried via `/la/grounding_query`. The orchestrator node bridges the two: it subscribes to YOLO detections for scene context, forwards text queries to LA, and publishes enriched responses.
 - **OCR on cubes**: Not part of the detection cycle. Run via the grounding module:
   ```bash
   ./run_la_grounding.sh "read the text on the cube"
