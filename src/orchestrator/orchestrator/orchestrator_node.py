@@ -17,6 +17,7 @@ Topics:
     /orchestrator/response (std_msgs/String)               — query answer
 """
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -37,6 +38,29 @@ _TRT_LIBS = (
 )
 
 
+def parse_box_detections(text: str) -> list:
+    """Extract (label, [x1,y1,x2,y2]) pairs from LA <box> output.
+
+    Returns list of (class_name, [x1, y1, x2, y2]) in [0, 1000] token coords.
+    """
+    results = []
+    for match in re.finditer(r'<box>(.+?)</box>', text):
+        coords_str = match.group(1)
+        coords = [float(p) for p in re.findall(r'[\d.]+', coords_str)]
+        if len(coords) != 4:
+            continue
+        before = text[:match.start()]
+        ref_matches = re.findall(r'<ref>(.+?)</ref>', before)
+        if ref_matches:
+            label = ref_matches[-1].strip()
+        else:
+            end = match.end()
+            context = text[end:end + 60].strip().rstrip(',').rstrip('.').strip()
+            label = ' '.join(context.split()[:3]) if context else "object"
+        results.append((label, coords))
+    return results
+
+
 class OrchestratorNode(Node):
     def __init__(self):
         super().__init__('orchestrator_node')
@@ -51,15 +75,12 @@ class OrchestratorNode(Node):
         self.img_h = 480
         self.query_pending = False
 
-        # Subscribe to camera_info for image dimensions
         self._camera_info_sub = self.create_subscription(
             CameraInfo, '/camera/camera_info', self._camera_info_callback, 10)
 
-        # Spawn subprocesses
         self._start_yolo(model_id)
         self._start_la()
 
-        # Subscriptions
         self.create_subscription(Detection2DArray, '/yolo/detections_2d',
                                  self._yolo_callback, 10)
         self.create_subscription(String, '/orchestrator/query',
@@ -67,7 +88,6 @@ class OrchestratorNode(Node):
         self.create_subscription(String, '/la/grounding_text',
                                  self._la_response_callback, 10)
 
-        # Publishers
         self._query_pub = self.create_publisher(String, '/la/grounding_query', 10)
         self._response_pub = self.create_publisher(String, '/orchestrator/response', 10)
 
@@ -124,15 +144,11 @@ class OrchestratorNode(Node):
             x2 = int((min(w, cx + sx / 2) / w) * 1000)
             y2 = int((min(h, cy + sy / 2) / h) * 1000)
             cls = det.results[0].hypothesis.class_id if det.results else 'object'
-            tid = det.id
-            if tid:
-                ctx_parts.append(f"<box>{x1},{y1},{x2},{y2}</box> {cls} ID:{tid}")
-            else:
-                ctx_parts.append(f"<box>{x1},{y1},{x2},{y2}</box> {cls}")
+            ctx_parts.append(f"<box>{x1},{y1},{x2},{y2}</box> {cls}")
         if not ctx_parts:
             return ''
         ctx = ", ".join(ctx_parts)
-        return f"Previously detected: {ctx}."
+        return f"[ Previous Predictions (Context): {ctx} ]"
 
     def _yolo_callback(self, msg):
         self.latest_yolo_dets = msg
@@ -146,9 +162,9 @@ class OrchestratorNode(Node):
 
         context = self._yolo_dets_to_context()
         if context:
-            augmented = f"{context} {query}"
+            augmented = f"Given the Context answer the Query; {context}; Query: {query}"
         else:
-            augmented = query
+            augmented = f"Given the Context answer the Query; Query: {query}"
 
         out = String()
         out.data = augmented
@@ -161,6 +177,21 @@ class OrchestratorNode(Node):
 
         response = msg.data
         self.get_logger().info(f'[Orch] LA response:\n{response}')
+
+        # Parse any <box> detections from LA response
+        dets = parse_box_detections(response)
+        w, h = self.img_w, self.img_h
+        if dets and w > 0 and h > 0:
+            lines = []
+            for label, token_box in dets:
+                x1 = int((token_box[0] / 1000.0) * w)
+                y1 = int((token_box[1] / 1000.0) * h)
+                x2 = int((token_box[2] / 1000.0) * w)
+                y2 = int((token_box[3] / 1000.0) * h)
+                lines.append(f"  {label} @ [{x1} {y1} {x2} {y2}]")
+            det_str = '\n'.join(lines)
+            self.get_logger().info(f'[Orch] Box detections:\n{det_str}')
+
         yolo_count = len(self.latest_yolo_dets.detections) if self.latest_yolo_dets else 0
 
         enriched = f'{response}\n---\nYOLO detections in scene: {yolo_count}'
