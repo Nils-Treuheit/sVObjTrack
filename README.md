@@ -18,7 +18,8 @@ ros2 launch camera_nodes cameras.launch.py 0
 # Terminal 2: Orchestrator — manages YOLO + LA internally
 ./run_orchestrator_node.sh                          # default: yolo26 + yolo26-obb + yolo26-pose
 ./run_orchestrator_node.sh yolo11                   # single model
-./run_orchestrator_node.sh '[yolo26, cubified]'     # custom fusion
+./run_orchestrator_node.sh unified                  # unified 161-cls OBB (COCO + DOTA + cubes)
+./run_orchestrator_node.sh '[yolo26, unified]'      # fusion AABB + unified OBB
 
 # Terminal 3: Watch detections
 ros2 run rqt_image_view rqt_image_view
@@ -152,6 +153,8 @@ Single model:
 ./run_yolo_node.sh cubified       # Oriented bounding boxes
 ./run_yolo_node.sh yolo11-pose    # YOLO11 pose (keypoints)
 ./run_yolo_node.sh yolo26-pose    # YOLO26 pose (keypoints)
+./run_yolo_node.sh unified        # Unified 161-cls OBB (COCO 0-79, DOTA 80-94, cubes 95-160)
+./run_yolo_node.sh yolo26-cubified-v2                            # same, explicit name
 ```
 
 Model fusion (pass as comma-separated list inside brackets):
@@ -159,6 +162,7 @@ Model fusion (pass as comma-separated list inside brackets):
 ./run_yolo_node.sh '[yolo26, cubified]'                   # AABB + OBB fusion
 ./run_yolo_node.sh '[yolo26, yolo11-pose]'                # AABB + pose fusion
 ./run_yolo_node.sh '[yolo26, cubified, yolo11-pose]'      # AABB + OBB + pose fusion
+./run_yolo_node.sh '[yolo26, unified]'                    # AABB + unified OBB fusion
 ```
 
 Fusion runs all models on every frame and applies cross-model NMS:
@@ -178,6 +182,10 @@ Detection:
 - YOLO11 AABB: `models/yolo11m.pt`
 - YOLO26 AABB: `models/yolo26m.pt`
 - YOLO Cubified OBB: `models/yolo_cubified.pt`
+- Unified OBB (161 cls): `models/yolo26-obb_cubified_v2.pt`
+  - Classes 0–79: COCO, 80–94: DOTA, 95–160: cube character faces
+  - Single `OBB26` head, trained via `--arch unified` (see `YOLO26_Retrain_Cubes/`)
+  - Shortcut: `unified` or `yolo26-cubified-v2`
 
 Pose (download separately from ultralytics):
 - YOLO11 Pose: `models/yolo11m-pose.pt`
@@ -238,8 +246,8 @@ ros2 topic pub -1 /la/grounding_query std_msgs/msg/String "data: 'human plant ch
 ```
 
 ### yolo_node
-- `model_id` — path or shortcut: `yolo11`/`yolo26`/`cubified`/`yolo11-pose`/`yolo26-pose`
-  - Fusion: `[yolo26, cubified]` / `[yolo26, yolo11-pose]` / `[yolo26, cubified, yolo11-pose]`
+- `model_id` — path or shortcut: `yolo11`/`yolo26`/`cubified`/`yolo11-pose`/`yolo26-pose`/`unified`
+  - Fusion: `[yolo26, cubified]` / `[yolo26, unified]` / `[yolo26, cubified, yolo11-pose]`
 - `model_type` — `AABB` or `OBB` or `pose` or `[AABB, OBB, pose]` for fusion
 - `bb_tracker` — tracker config per model (default: `bytetrack.yaml`), e.g. `[bytetrack.yaml, bytetrack.yaml]` for fusion
 - `conf_threshold` (default: 0.4)

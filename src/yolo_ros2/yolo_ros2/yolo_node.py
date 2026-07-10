@@ -22,9 +22,6 @@ from vision_msgs.msg import (
 from cv_bridge import CvBridge
 import cv2
 
-import torch
-from ultralytics import YOLO
-from moe_yolo.moe_model import MoEYOLO
 from geometry_msgs.msg import PointStamped
 from typing import Tuple,List,Union
 from os.path import basename
@@ -39,6 +36,7 @@ MODEL_YOLO11_OBB = "models/yolo11s-obb.pt"
 MODEL_YOLO26_OBB = "models/yolo26s-obb.pt"
 MODEL_YOLO11_POSE = "models/yolo11s-pose.pt"
 MODEL_YOLO26_POSE = "models/yolo26s-pose.pt"
+MODEL_UNIFIED = "models/yolo26-obb_cubified_v2.pt"
 NC_CUBE = 66
 NC_NORMAL = 95
 
@@ -89,6 +87,9 @@ class YOLONode(Node):
             elif model_id == "yolo26-pose":
                 path = MODEL_YOLO26_POSE
                 model_type = "pose"
+            elif model_id in ("unified", "yolo26-cubified-v2"):
+                path = MODEL_UNIFIED
+                model_type = "OBB"
             elif model_id=="":
                 self.get_logger().warning(f"No model provided using YOLO26!")
                 path = MODEL_YOLO26
@@ -109,8 +110,10 @@ class YOLONode(Node):
         model_type:str = self.get_parameter("model_type").value
         bb_tracker:str = self.get_parameter("bb_tracker").value
         self.conf_threshold = self.get_parameter("conf_threshold").value
+
+        import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.models:Union[List[YOLO],YOLO,MoEYOLO]
+        self.models:Union[List,object]
 
         if model_id.startswith("["):
             self.model_ids = [m_id.strip() for m_id in model_id.strip('[]').split(',')]
@@ -125,27 +128,45 @@ class YOLONode(Node):
             self.bb_trackers = raw_trackers if raw_trackers else ['bytetrack.yaml']
             self.bb_trackers.extend(['bytetrack.yaml' for _ in range(len(self.model_ids) - len(self.bb_trackers))])
 
-            # model fusion
+            def _build_model(path, m_id):
+                if "MoE" in m_id or m_id == "cubified":
+                    from ultralytics import YOLO
+                    from moe_yolo.moe_model import MoEYOLO
+                    return MoEYOLO(YOLO(path), NC_NORMAL, NC_CUBE)
+                if path == MODEL_UNIFIED or m_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2"):
+                    from unified_yolo.unified_model import UnifiedYOLO
+                    return UnifiedYOLO(path, device)
+                from ultralytics import YOLO
+                return YOLO(path)
+
             self.models = list()
             self.model_types = list() 
-            for m_type,m_id in zip(model_types,self.model_ids):
-                path,m_t = translate_model_id(m_id, m_type) 
+            for m_type, m_id in zip(model_types, self.model_ids):
+                path, m_t = translate_model_id(m_id, m_type) 
                 self.model_types.append(m_t) 
-                self.models.append(MoEYOLO(path,NC_NORMAL,NC_CUBE) if "MoE" in model_id else YOLO(path))
-                self.models[-1]  
+                self.models.append(_build_model(path, m_id))
 
             self.get_logger().info(f"Fusion mode: combine YOLOs on {device}\n\t> (Models,Trackers):{list(zip(self.model_ids,self.bb_trackers))}")
         else:
             self.model_ids = model_id
-            path, m_type = translate_model_id(model_id,model_type)
+            path, m_type = translate_model_id(model_id, model_type)
             self.model_types = m_type
             self.bb_trackers = bb_tracker if bb_tracker else 'bytetrack.yaml'
-            self.models = MoEYOLO(path,NC_NORMAL,NC_CUBE) if "MoE" in model_id else YOLO(path)
-            self.models.to(device)
+            if "MoE" in model_id or model_id == "cubified":
+                from ultralytics import YOLO
+                from moe_yolo.moe_model import MoEYOLO
+                self.models = MoEYOLO(YOLO(path), NC_NORMAL, NC_CUBE)
+            elif path == MODEL_UNIFIED or model_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2"):
+                from unified_yolo.unified_model import UnifiedYOLO
+                self.models = UnifiedYOLO(path, device)
+            else:
+                from ultralytics import YOLO
+                self.models = YOLO(path)
+                self.models.to(device)
             self.get_logger().info(f"Single model: {basename(model_id).split('.')[0]} on {device}")
         
         self.colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255)] 
-        if isinstance(self.models,YOLO): self.colors = self.colors[0]
+        if not isinstance(self.models, list): self.colors = self.colors[0]
         elif len(self.colors)>len(self.models): self.colors = self.colors[:len(self.models)]
         else: 
             self.colors = set(self.colors) 
@@ -167,21 +188,15 @@ class YOLONode(Node):
         self.track_history = {}
         self._next_track_id = 1
 
-        self.source_sub = self.create_subscription(
-            String, "/camera/source_info", self.source_callback, 10)
+        self.source_sub = self.create_subscription(String, "/camera/source_info", self.source_callback, 10)
         self._depth_sub = None
         self._camera_info_sub = None
-        self.image_sub = self.create_subscription(
-            Image, "/camera/image_raw", self.image_callback, 10)
+        self.image_sub = self.create_subscription(Image, "/camera/image_raw", self.image_callback, 10)
 
-        self.det2d_pub = self.create_publisher(
-            Detection2DArray, "/yolo/detections_2d", 10)
-        self.det3d_pub = self.create_publisher(
-            Detection3DArray, "/yolo/detections_3d", 10)
-        self.point_pub = self.create_publisher(
-            PointStamped, "/yolo/object_point", 10)
-        self.image_pub = self.create_publisher(
-            Image, "/yolo/debug_image", 10)
+        self.det2d_pub = self.create_publisher(Detection2DArray, "/yolo/detections_2d", 10)
+        self.det3d_pub = self.create_publisher(Detection3DArray, "/yolo/detections_3d", 10)
+        self.point_pub = self.create_publisher(PointStamped, "/yolo/object_point", 10)
+        self.image_pub = self.create_publisher(Image, "/yolo/debug_image", 10)
 
     def source_callback(self, msg):
         new_source = msg.data
@@ -191,11 +206,9 @@ class YOLONode(Node):
         # Enable depth/CameraInfo only for realsense (has depth sensor)
         if new_source == "realsense":
             if self._depth_sub is None:
-                self._depth_sub = self.create_subscription(
-                    Image, "/camera/depth/image_raw", self._depth_callback, 10)
+                self._depth_sub = self.create_subscription(Image, "/camera/depth/image_raw", self._depth_callback, 10)
             if self._camera_info_sub is None:
-                self._camera_info_sub = self.create_subscription(
-                    CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
+                self._camera_info_sub = self.create_subscription(CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
         else:
             if self._depth_sub is not None:
                 self.destroy_subscription(self._depth_sub)
@@ -264,7 +277,7 @@ class YOLONode(Node):
             cv2.line(annotated, p1, p2, color, 2)
 
     # --- retrieve box preds ---
-    def _process_boxes(self, preds, m_id:str, model:YOLO, color:Tuple[int,int,int]) -> list:
+    def _process_boxes(self, preds, m_id:str, model, color:Tuple[int,int,int]) -> list:
         detections = []
         has_pose = hasattr(preds, 'keypoints') and preds.keypoints is not None
 

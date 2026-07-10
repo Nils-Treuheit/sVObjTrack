@@ -1,5 +1,13 @@
 #!/bin/bash
 # Run the YOLO ROS2 node
+#
+# Usage:
+#   ./run_yolo_node.sh                                    # default YOLO26 AABB
+#   ./run_yolo_node.sh yolo11                             # YOLO11 AABB
+#   ./run_yolo_node.sh cubified                           # OBB (yolo_cubified)
+#   ./run_yolo_node.sh unified                            # Unified 161-cls OBB
+#   ./run_yolo_node.sh yolo26-cubified-v2                 # Unified 161-cls OBB
+#   ./run_yolo_node.sh '[yolo26, unified]'                # Fusion AABB + unified OBB
 set -e
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
