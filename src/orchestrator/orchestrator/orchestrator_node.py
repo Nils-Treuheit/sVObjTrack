@@ -1,13 +1,14 @@
 """
-Orchestrator node — manages YOLO detection + LocateAnything subprocesses
+Orchestrator node — manages YOLO/LocateAnything/RF-DETR subprocesses
 and bridges text queries to LA responses.
 
 By default starts YOLO fusion: yolo26 + yolo26-obb + yolo26-pose.
-Pass a different model_id parameter to override (single model or fusion list).
+Pass model_id='rfdetr' to use RF-DETR instead of YOLO.
 
 Topics:
   Subscribed:
     /yolo/detections_2d    (vision_msgs/Detection2DArray)  — from managed YOLO
+    /rfdetr/detections_2d  (vision_msgs/Detection2DArray)  — from managed RF-DETR
     /orchestrator/query    (std_msgs/String)               — text query from user
     /la/grounding_text     (std_msgs/String)               — LA query responses
     /camera/camera_info    (sensor_msgs/CameraInfo)        — image dimensions
@@ -21,6 +22,7 @@ import re
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -31,11 +33,32 @@ from vision_msgs.msg import Detection2DArray
 LA_PROJECT = "/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/locate_anything"
 LA_TRT = f"{LA_PROJECT}/model/tensorRT"
 
+RFDETR_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/rfdetr/.venv'
+
+SAM3_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/.venv'
+
 _TRT_LIBS = (
     f"{LA_TRT}/.venv/lib/python3.10/site-packages/tensorrt_libs:"
     f"{os.path.expanduser('~')}/.local/lib/python3.10/site-packages/nvidia/cudnn/lib:"
     "/usr/local/cuda-12.8/lib64"
 )
+
+
+def _find_venv_python():
+    """Find the sVObjTrack venv Python, falling back to sys.executable."""
+    # Walk up from this file to find .venv/bin/python3
+    here = Path(__file__).resolve().parent
+    for _ in range(10):
+        candidate = here / '.venv' / 'bin' / 'python3'
+        if candidate.exists():
+            return str(candidate)
+        here = here.parent
+    # Check workspace root
+    ws = Path(__file__).resolve().parent.parent.parent.parent
+    candidate = ws / '.venv' / 'bin' / 'python3'
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
 
 
 def parse_box_detections(text: str) -> list:
@@ -66,11 +89,18 @@ class OrchestratorNode(Node):
         super().__init__('orchestrator_node')
 
         self.declare_parameter('model_id', '[yolo26, yolo26-obb, yolo26-pose]')
+        self.declare_parameter('use_depth', False)
+        self.declare_parameter('use_sam3', False)
         model_id = self.get_parameter('model_id').value
+        use_depth = self.get_parameter('use_depth').value
+        use_sam3 = self.get_parameter('use_sam3').value
 
         self._yolo_proc = None
         self._la_proc = None
-        self.latest_yolo_dets = None
+        self._rf_proc = None
+        self._depth_proc = None
+        self._sam3_proc = None
+        self.latest_dets = None
         self.img_w = 640
         self.img_h = 480
         self.query_pending = False
@@ -78,11 +108,25 @@ class OrchestratorNode(Node):
         self._camera_info_sub = self.create_subscription(
             CameraInfo, '/camera/camera_info', self._camera_info_callback, 10)
 
-        self._start_yolo(model_id)
+        # Determine which detection backend to use
+        self.use_rfdetr = model_id.strip().lower() == 'rfdetr'
+        if self.use_rfdetr:
+            self._start_rfdetr()
+            self.create_subscription(Detection2DArray, '/rfdetr/detections_2d',
+                                     self._det_callback, 10)
+        else:
+            self._start_yolo(model_id)
+            self.create_subscription(Detection2DArray, '/yolo/detections_2d',
+                                     self._det_callback, 10)
+
         self._start_la()
 
-        self.create_subscription(Detection2DArray, '/yolo/detections_2d',
-                                 self._yolo_callback, 10)
+        if use_depth:
+            self._start_depth()
+
+        if use_sam3:
+            self._start_sam3()
+
         self.create_subscription(String, '/orchestrator/query',
                                  self._query_in_callback, 10)
         self.create_subscription(String, '/la/grounding_text',
@@ -91,8 +135,9 @@ class OrchestratorNode(Node):
         self._query_pub = self.create_publisher(String, '/la/grounding_query', 10)
         self._response_pub = self.create_publisher(String, '/orchestrator/response', 10)
 
+        backend = 'RF-DETR' if self.use_rfdetr else f'YOLO({model_id})'
         self.get_logger().info(
-            f'[Orch] Started with model_id={model_id}. '
+            f'[Orch] Started with backend={backend}. '
             f'Publish text queries to /orchestrator/query.')
 
     def _camera_info_callback(self, msg):
@@ -100,7 +145,7 @@ class OrchestratorNode(Node):
         self.img_h = msg.height
 
     def _start_yolo(self, model_id):
-        python = sys.executable
+        python = _find_venv_python()
         cmd = [
             python, '-m', 'yolo_ros2.yolo_node',
             '--ros-args', '-p', f"model_id:='{model_id}'",
@@ -112,8 +157,22 @@ class OrchestratorNode(Node):
         except Exception as e:
             self.get_logger().error(f'[Orch] Failed to start YOLO: {e}')
 
+    def _start_rfdetr(self):
+        python = _find_venv_python()
+        env = os.environ.copy()
+        existing_pp = env.get('PYTHONPATH', '')
+        rf_site = f'{RFDETR_VENV}/lib/python3.10/site-packages'
+        env['PYTHONPATH'] = f'{rf_site}:{existing_pp}' if existing_pp else rf_site
+        cmd = [python, '-m', 'rfdetr_ros2.rfdetr_node']
+        self.get_logger().info(f'[Orch] Spawning RF-DETR: {" ".join(cmd)}')
+        try:
+            self._rf_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, env=env)
+        except Exception as e:
+            self.get_logger().error(f'[Orch] Failed to start RF-DETR: {e}')
+
     def _start_la(self):
-        python = sys.executable
+        python = _find_venv_python()
         cmd = [python, '-m', 'locate_anything_ros2.la_node',
                '--ros-args', '-p', 'query_only:=True']
         env = os.environ.copy()
@@ -126,15 +185,38 @@ class OrchestratorNode(Node):
         except Exception as e:
             self.get_logger().error(f'[Orch] Failed to start LA: {e}')
 
+    def _start_depth(self):
+        python = _find_venv_python()
+        cmd = [python, '-m', 'depth_ros2.depth_node']
+        self.get_logger().info(f'[Orch] Spawning depth node: {" ".join(cmd)}')
+        try:
+            self._depth_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        except Exception as e:
+            self.get_logger().error(f'[Orch] Failed to start depth node: {e}')
+
+    def _start_sam3(self):
+        sam3_python = f'{SAM3_VENV}/bin/python3'
+        if not os.path.isfile(sam3_python):
+            self.get_logger().error(f'[Orch] SAM3 venv Python not found: {sam3_python}')
+            return
+        cmd = [sam3_python, '-m', 'sam3_ros2.sam3_node']
+        self.get_logger().info(f'[Orch] Spawning SAM 3.1: {" ".join(cmd)}')
+        try:
+            self._sam3_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        except Exception as e:
+            self.get_logger().error(f'[Orch] Failed to start SAM 3.1: {e}')
+
     def _yolo_dets_to_context(self):
-        """Convert latest YOLO detections to LA token-coordinate context string."""
-        if self.latest_yolo_dets is None or not self.latest_yolo_dets.detections:
+        """Convert latest detections to LA token-coordinate context string."""
+        if self.latest_dets is None or not self.latest_dets.detections:
             return ''
         w, h = self.img_w, self.img_h
         if w == 0 or h == 0:
             return ''
         ctx_parts = []
-        for det in self.latest_yolo_dets.detections:
+        for det in self.latest_dets.detections:
             cx = det.bbox.center.position.x
             cy = det.bbox.center.position.y
             sx = det.bbox.size_x
@@ -150,8 +232,8 @@ class OrchestratorNode(Node):
         ctx = ", ".join(ctx_parts)
         return f"[ Previous Predictions (Context): {ctx} ]"
 
-    def _yolo_callback(self, msg):
-        self.latest_yolo_dets = msg
+    def _det_callback(self, msg):
+        self.latest_dets = msg
 
     def _query_in_callback(self, msg):
         query = msg.data.strip()
@@ -192,9 +274,9 @@ class OrchestratorNode(Node):
             det_str = '\n'.join(lines)
             self.get_logger().info(f'[Orch] Box detections:\n{det_str}')
 
-        yolo_count = len(self.latest_yolo_dets.detections) if self.latest_yolo_dets else 0
+        yolo_count = len(self.latest_dets.detections) if self.latest_dets else 0
 
-        enriched = f'{response}\n---\nYOLO detections in scene: {yolo_count}'
+        enriched = f'{response}\n---\nDetections in scene: {yolo_count}'
 
         out = String()
         out.data = enriched
@@ -203,16 +285,36 @@ class OrchestratorNode(Node):
     def _kill_proc(self, proc, name):
         if proc is None:
             return
+        if proc.poll() is not None:
+            self.get_logger().info(f'[Orch] {name} already exited (code={proc.returncode})')
+            return
         self.get_logger().info(f'[Orch] Shutting down {name}...')
-        proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.get_logger().warning(f'[Orch] {name} did not exit after SIGTERM, sending SIGKILL')
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.get_logger().error(f'[Orch] {name} survived SIGKILL')
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            self.get_logger().warning(f'[Orch] Error killing {name}: {e}')
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
     def destroy_node(self):
         self._kill_proc(self._yolo_proc, 'YOLO')
+        self._kill_proc(self._rf_proc, 'RF-DETR')
+        self._kill_proc(self._depth_proc, 'Depth')
+        self._kill_proc(self._sam3_proc, 'SAM3')
         self._kill_proc(self._la_proc, 'LA')
         super().destroy_node()
 

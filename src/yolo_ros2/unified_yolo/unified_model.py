@@ -1,11 +1,12 @@
 """
 Unified YOLO26 OBB model (161-class: COCO + DOTA + cubes).
 
-Wraps the SingleHeadOBB architecture trained via
-``train.py --arch unified`` (see YOLO26_Retrain_Cubes/).
+Supports two architectures trained via ``train.py``:
+  - ``--arch unified``  → SingleHeadOBB (single backbone + OBB26 head)
+  - ``--arch fused``    → DualBackbone (COCO + DOTA backbones + fusion + OBB26 head)
 
-Provides an ultralytics-compatible inference interface so it plugs into
-the existing yolo_node.py fusion pipeline.
+Both expose the same ultralytics-compatible inference interface so they plug
+into the existing yolo_node.py fusion pipeline.
 
 All heavy imports (torch, ultralytics) are lazy inside constructors
 so module-level import of ``unified_yolo`` is fast.
@@ -19,7 +20,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# Default base weights for unified (single-backbone) architecture
 BASE_WEIGHTS = "models/yolo26m.pt"
+
+# Default base weights for fused (dual-backbone) architecture
+BASE_WEIGHTS_COCO = "models/yolo26s.pt"
+BASE_WEIGHTS_DOTA = "models/yolo26s-obb.pt"
 
 DOTA_CLASSES = [
     "plane", "ship", "storage-tank", "baseball-diamond", "tennis-court",
@@ -97,6 +103,106 @@ class _UnifiedResults:
         return self._obbs if self._obbs else None
 
 
+# ── helpers for feature channel detection ──
+
+def _detect_feature_channels(backbone, head_input_idx):
+    """Detect output channels of the layers feeding the head."""
+    chs = []
+    for idx in head_input_idx:
+        layer = backbone[idx]
+        if hasattr(layer, 'cv1') and hasattr(layer.cv1, 'conv'):
+            chs.append(layer.cv1.conv.out_channels)
+        elif hasattr(layer, 'cv2') and hasattr(layer.cv2, 'conv'):
+            chs.append(layer.cv2.conv.out_channels)
+        elif hasattr(layer, 'conv'):
+            chs.append(layer.conv.out_channels)
+        else:
+            for m in layer.modules():
+                if isinstance(m, torch.nn.Conv2d):
+                    chs.append(m.out_channels)
+                    break
+    return chs
+
+
+def _load_compatible(src_module, dst_module):
+    """Copy weights where shapes match, skip incompatible keys."""
+    src_sd = src_module.state_dict()
+    dst_sd = dst_module.state_dict()
+    compatible = {}
+    for key in src_sd:
+        if key in dst_sd and src_sd[key].shape == dst_sd[key].shape:
+            compatible[key] = src_sd[key]
+    if compatible:
+        dst_module.load_state_dict(compatible, strict=False)
+
+
+def _copy_class_slice_expand(src_module, dst_module, dst_offset, n_copy):
+    """Copy class weights from a narrower-input conv to a wider-input conv."""
+    src_last = src_module[-1]
+    dst_last = dst_module[-1]
+    if not isinstance(src_last, nn.Conv2d) or not isinstance(dst_last, nn.Conv2d):
+        return
+    n = min(n_copy, src_last.out_channels, max(dst_last.out_channels - dst_offset, 0))
+    if n <= 0:
+        return
+    src_in = src_last.in_channels
+    dst_in = dst_last.in_channels
+    with torch.no_grad():
+        if src_in >= dst_in:
+            dst_last.weight[dst_offset:dst_offset + n] = src_last.weight[:n, :dst_in]
+        else:
+            padded = dst_last.weight.new_zeros(n, dst_in, 1, 1)
+            padded[:, :src_in] = src_last.weight[:n]
+            dst_last.weight[dst_offset:dst_offset + n] = padded
+        if dst_last.bias is not None and src_last.bias is not None:
+            dst_last.bias[dst_offset:dst_offset + n] = src_last.bias[:n].clone()
+
+
+def _mixed_init_head(head, coco_head, dota_obb_head):
+    """Initialise unified OBB26 head from COCO Detect + DOTA OBB pretrained heads."""
+    for i in range(len(dota_obb_head.cv2)):
+        _load_compatible(dota_obb_head.cv2[i], head.cv2[i])
+        if hasattr(dota_obb_head, "one2one_cv2"):
+            _load_compatible(dota_obb_head.one2one_cv2[i], head.one2one_cv2[i])
+    if hasattr(dota_obb_head, "cv4") and hasattr(head, "cv4"):
+        for i in range(len(dota_obb_head.cv4)):
+            _load_compatible(dota_obb_head.cv4[i], head.cv4[i])
+            if hasattr(dota_obb_head, "one2one_cv4"):
+                _load_compatible(dota_obb_head.one2one_cv4[i], head.one2one_cv4[i])
+    for i in range(len(dota_obb_head.cv3)):
+        _load_compatible(dota_obb_head.cv3[i], head.cv3[i])
+        if hasattr(dota_obb_head, "one2one_cv3"):
+            _load_compatible(dota_obb_head.one2one_cv3[i], head.one2one_cv3[i])
+    for i in range(len(dota_obb_head.cv3)):
+        _copy_class_slice_expand(coco_head.cv3[i], head.cv3[i], 0, 80)
+        _copy_class_slice_expand(dota_obb_head.cv3[i], head.cv3[i], 80, 15)
+        if hasattr(coco_head, "one2one_cv3") and hasattr(head, "one2one_cv3"):
+            _copy_class_slice_expand(coco_head.one2one_cv3[i], head.one2one_cv3[i], 0, 80)
+            _copy_class_slice_expand(dota_obb_head.one2one_cv3[i], head.one2one_cv3[i], 80, 15)
+
+
+def _forward_backbone(model_list, x, save_indices, head_input_idx):
+    """Run forward pass through a YOLO backbone+neck and collect feature maps."""
+    y = [None] * len(model_list)
+    out = []
+    for m in model_list:
+        if m.f != -1:
+            x_in = [y[j] if isinstance(j, int) and j != -1 else x if j == -1 else x for j in m.f]
+            if isinstance(x_in, list):
+                x_in = x_in if len(x_in) > 1 else x_in[0]
+            else:
+                x_in = x_in
+        else:
+            x_in = x
+        x = m(x_in)
+        y[m.i] = x if m.i in save_indices else None
+        if m.i in head_input_idx:
+            out.append(x)
+    return out
+
+
+# ── model wrappers ──
+
 class SingleHeadOBB(nn.Module):
     """Single-head OBB model — identical architecture to training.
 
@@ -126,17 +232,6 @@ class SingleHeadOBB(nn.Module):
         stride = self.stride
         self.head.stride = stride.clone() if hasattr(stride, 'clone') else stride
 
-    @staticmethod
-    def _load_compatible(src_module, dst_module):
-        src_sd = src_module.state_dict()
-        dst_sd = dst_module.state_dict()
-        compatible = {}
-        for key in src_sd:
-            if key in dst_sd and src_sd[key].shape == dst_sd[key].shape:
-                compatible[key] = src_sd[key]
-        if compatible:
-            dst_module.load_state_dict(compatible, strict=False)
-
     def forward_features(self, x):
         y, out = [], []
         for m in self.model:
@@ -154,11 +249,81 @@ class SingleHeadOBB(nn.Module):
         return self.head(feats)
 
 
+class DualBackboneOBB(nn.Module):
+    """Dual-backbone fused model — identical architecture to training.
+
+    Two YOLO backbones (COCO + DOTA) → feature concat → fusion convs → OBB26 head.
+    """
+
+    def __init__(self, coco_weights, dota_weights, nc=161, args=None):
+        super().__init__()
+        from ultralytics import YOLO
+        from ultralytics.nn.modules import OBB26
+
+        coco_base = YOLO(coco_weights)
+        self.backbone_coco = coco_base.model.model
+
+        dota_base = YOLO(dota_weights)
+        self.backbone_dota = dota_base.model.model
+
+        self.stride = dota_base.model.stride
+        self.save = dota_base.model.save
+        self.head_input_idx = dota_base.model.model[-1].f
+
+        self.nc = nc
+        self.args = args
+
+        coco_chs = _detect_feature_channels(self.backbone_coco, self.head_input_idx)
+        dota_chs = _detect_feature_channels(self.backbone_dota, self.head_input_idx)
+        fused_chs = [min(256, c + d) for c, d in zip(coco_chs, dota_chs)]
+
+        self.fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(c + d, f, 3, padding=1, bias=False),
+                nn.BatchNorm2d(f),
+                nn.SiLU(inplace=True),
+            )
+            for c, d, f in zip(coco_chs, dota_chs, fused_chs)
+        ])
+
+        self.head = OBB26(
+            nc=nc, ne=1, reg_max=1,
+            end2end=True, ch=fused_chs,
+        )
+        self.head.stride = self.stride.clone() if hasattr(self.stride, "clone") else self.stride
+
+        coco_head = coco_base.model.model[-1]
+        dota_obb_head = dota_base.model.model[-1]
+        _mixed_init_head(self.head, coco_head, dota_obb_head)
+
+    def forward_features(self, x):
+        """Run both backbones, fuse features, return head input list."""
+        save_set = set(self.save)
+        feats_coco = _forward_backbone(
+            self.backbone_coco, x, save_set, self.head_input_idx)
+        feats_dota = _forward_backbone(
+            self.backbone_dota, x, save_set, self.head_input_idx)
+        fused = []
+        for fc, fd, conv in zip(feats_coco, feats_dota, self.fusion):
+            fused.append(conv(torch.cat([fc, fd], dim=1)))
+        return fused
+
+    def forward(self, x):
+        feats = self.forward_features(x)
+        return self.head(feats)
+
+
+# ── public interface ──
+
 class UnifiedYOLO(nn.Module):
     """Unified YOLO26 wrapper for ROS2 inference.
 
+    Automatically detects architecture from checkpoint:
+      - ``arch=fused``    → DualBackboneOBB (COCO s + DOTA s-obb + fusion)
+      - ``arch=unified``  → SingleHeadOBB (COCO m + OBB26 head)
+
     Usage:
-        model = UnifiedYOLO("models/yolo26-obb_cubified_v2.pt")
+        model = UnifiedYOLO("runs/moe/fused_v2/weights/last.pt")
         results = model.track(frame, ...)
         for obb in results[0].obb:
             print(obb.xywhr, obb.conf, obb.cls)
@@ -171,6 +336,26 @@ class UnifiedYOLO(nn.Module):
         self._build_model()
 
     def _build_model(self):
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+        from ultralytics.utils import IterableSimpleNamespace
+
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        arch = ckpt.get("arch", "unified")
+        sd = ckpt["model_state_dict"]
+
+        if arch == "fused":
+            self._build_fused(sd, ckpt)
+        else:
+            self._build_single(sd, ckpt)
+
+        self.inner.eval()
+        self.names = {**NAMES_DICT}
+        print(f"[UnifiedYOLO] Loaded {self.checkpoint_path} "
+              f"(arch={arch}, epoch {ckpt.get('epoch', '?')}, "
+              f"{len(NAMES_DICT)} classes)")
+
+    def _build_single(self, sd, ckpt):
+        """Build SingleHeadOBB from yolo26m.pt base."""
         from ultralytics import YOLO
         from ultralytics.cfg import DEFAULT_CFG_DICT
         from ultralytics.utils import IterableSimpleNamespace
@@ -179,24 +364,41 @@ class UnifiedYOLO(nn.Module):
         base_model = base.model
 
         args_dict = dict(base_model.args) if base_model.args else {}
-        hyp = {**DEFAULT_CFG_DICT, "box": 7.5, "cls": 0.5, "dfl": 1.5, "angle": 7.5, **args_dict}
+        hyp = {**DEFAULT_CFG_DICT, "box": 7.5, "cls": 0.5, "dfl": 1.5,
+               "angle": 7.5, **args_dict}
         base_model.args = IterableSimpleNamespace(**hyp)
 
         self.inner = SingleHeadOBB(base_model, nc=161, args=base_model.args)
         self.inner.to(self.device)
 
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-        sd = ckpt["model_state_dict"]
         missing, unexpected = self.inner.load_state_dict(sd, strict=False)
         if missing:
             print(f"[UnifiedYOLO] Missing keys: {len(missing)}")
         if unexpected:
             print(f"[UnifiedYOLO] Unexpected keys: {len(unexpected)}")
 
-        self.inner.eval()
-        self.names = {**NAMES_DICT}
-        print(f"[UnifiedYOLO] Loaded {self.checkpoint_path} "
-              f"(epoch {ckpt.get('epoch', '?')}, {len(NAMES_DICT)} classes)")
+    def _build_fused(self, sd, ckpt):
+        """Build DualBackboneOBB from yolo26s.pt + yolo26s-obb.pt bases."""
+        coco_weights = str(Path(self.checkpoint_path).parent.parent.parent
+                           / "models" / "yolo26s.pt")
+        if not Path(coco_weights).exists():
+            coco_weights = BASE_WEIGHTS_COCO
+        dota_weights = str(Path(self.checkpoint_path).parent.parent.parent
+                           / "models" / "yolo26s-obb.pt")
+        if not Path(dota_weights).exists():
+            dota_weights = BASE_WEIGHTS_DOTA
+
+        print(f"[UnifiedYOLO] Fused arch: COCO={coco_weights}, DOTA={dota_weights}")
+
+        self.inner = DualBackboneOBB(coco_weights, dota_weights, nc=161)
+        self.inner.to(self.device)
+
+        missing, unexpected = self.inner.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"[UnifiedYOLO] Missing keys (expected for architecture differences): "
+                  f"{len(missing)}")
+        if unexpected:
+            print(f"[UnifiedYOLO] Unexpected keys: {len(unexpected)}")
 
     @torch.no_grad()
     def _decode_head(self, preds_dict, conf_thresh=0.25, max_det=300):

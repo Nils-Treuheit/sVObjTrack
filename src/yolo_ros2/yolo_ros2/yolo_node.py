@@ -31,12 +31,13 @@ from random import randint
 # Default Fallback Models
 MODEL_YOLO11 = "models/yolo11m.pt"
 MODEL_YOLO26 = "models/yolo26m.pt"
-MODEL_CUBIFIED = "models/yolo_cubified.pt"
+MODEL_CUBIFIED = "models/yolo26-obb_cubified_v1.pt"
 MODEL_YOLO11_OBB = "models/yolo11s-obb.pt"
 MODEL_YOLO26_OBB = "models/yolo26s-obb.pt"
 MODEL_YOLO11_POSE = "models/yolo11s-pose.pt"
 MODEL_YOLO26_POSE = "models/yolo26s-pose.pt"
 MODEL_UNIFIED = "models/yolo26-obb_cubified_v2.pt"
+MODEL_YOLOWORLD = "models/yolov8s-worldv2.pt"
 NC_CUBE = 66
 NC_NORMAL = 95
 
@@ -90,6 +91,9 @@ class YOLONode(Node):
             elif model_id in ("unified", "yolo26-cubified-v2"):
                 path = MODEL_UNIFIED
                 model_type = "OBB"
+            elif model_id in ("yoloworld", "yolo-world", "yolow"):
+                path = MODEL_YOLOWORLD
+                model_type = "AABB"
             elif model_id=="":
                 self.get_logger().warning(f"No model provided using YOLO26!")
                 path = MODEL_YOLO26
@@ -105,11 +109,14 @@ class YOLONode(Node):
         self.declare_parameter("model_type", "")
         self.declare_parameter("bb_tracker", "")
         self.declare_parameter("conf_threshold", 0.4)
+        self.declare_parameter("classes", "")  # YOLO-World vocabulary (comma-separated)
 
         model_id:str = self.get_parameter("model_id").value
         model_type:str = self.get_parameter("model_type").value
         bb_tracker:str = self.get_parameter("bb_tracker").value
         self.conf_threshold = self.get_parameter("conf_threshold").value
+        classes_str:str = self.get_parameter("classes").value
+        self.yolo_world_classes = [c.strip() for c in classes_str.split(',') if c.strip()] if classes_str else []
 
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -133,9 +140,15 @@ class YOLONode(Node):
                     from ultralytics import YOLO
                     from moe_yolo.moe_model import MoEYOLO
                     return MoEYOLO(YOLO(path), NC_NORMAL, NC_CUBE)
-                if path == MODEL_UNIFIED or m_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2"):
+                if path == MODEL_UNIFIED or m_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2") or "fused" in basename(path).lower():
                     from unified_yolo.unified_model import UnifiedYOLO
                     return UnifiedYOLO(path, device)
+                if m_id in ("yoloworld", "yolo-world", "yolow") or "yoloworld" in basename(path).lower():
+                    from ultralytics import YOLOWorld
+                    model = YOLOWorld(path)
+                    if self.yolo_world_classes:
+                        model.set_classes(self.yolo_world_classes)
+                    return model
                 from ultralytics import YOLO
                 return YOLO(path)
 
@@ -156,9 +169,14 @@ class YOLONode(Node):
                 from ultralytics import YOLO
                 from moe_yolo.moe_model import MoEYOLO
                 self.models = MoEYOLO(YOLO(path), NC_NORMAL, NC_CUBE)
-            elif path == MODEL_UNIFIED or model_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2"):
+            elif path == MODEL_UNIFIED or model_id in ("unified", "yolo26-cubified-v2") or basename(path).startswith("yolo26-obb_cubified_v2") or "fused" in basename(path).lower():
                 from unified_yolo.unified_model import UnifiedYOLO
                 self.models = UnifiedYOLO(path, device)
+            elif model_id in ("yoloworld", "yolo-world", "yolow") or "yoloworld" in basename(path).lower():
+                from ultralytics import YOLOWorld
+                self.models = YOLOWorld(path)
+                if self.yolo_world_classes:
+                    self.models.set_classes(self.yolo_world_classes)
             else:
                 from ultralytics import YOLO
                 self.models = YOLO(path)
@@ -203,21 +221,14 @@ class YOLONode(Node):
         if new_source == self.camera_source:
             return
         self.camera_source = new_source
-        # Enable depth/CameraInfo only for realsense (has depth sensor)
-        if new_source == "realsense":
-            if self._depth_sub is None:
-                self._depth_sub = self.create_subscription(Image, "/camera/depth/image_raw", self._depth_callback, 10)
-            if self._camera_info_sub is None:
-                self._camera_info_sub = self.create_subscription(CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
-        else:
-            if self._depth_sub is not None:
-                self.destroy_subscription(self._depth_sub)
-                self._depth_sub = None
-                self.depth_image = None
-            if self._camera_info_sub is not None:
-                self.destroy_subscription(self._camera_info_sub)
-                self._camera_info_sub = None
-                self.camera_info = None
+        # Always subscribe to depth/CameraInfo — works for realsense (hardware)
+        # and depth_ros2 (monocular depth estimation for USB webcam).
+        if self._depth_sub is None:
+            self._depth_sub = self.create_subscription(
+                Image, "/camera/depth/image_raw", self._depth_callback, 10)
+        if self._camera_info_sub is None:
+            self._camera_info_sub = self.create_subscription(
+                CameraInfo, "/camera/camera_info", self._camera_info_callback, 10)
 
     def _depth_callback(self, msg):
         self.depth_image = self.bridge.imgmsg_to_cv2(
@@ -440,9 +451,7 @@ class YOLONode(Node):
             self._draw_keypoints(annotated, kpts, kpt_conf)
 
         point_3d = None
-        if (self.camera_source == "realsense"
-                and self.depth_image is not None
-                and self.camera_info is not None):
+        if self.depth_image is not None and self.camera_info is not None:
             point_3d = self.project_3d(cx, cy)
 
         if is_obb_result:

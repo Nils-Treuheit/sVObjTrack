@@ -1,8 +1,6 @@
 from setuptools import find_packages, setup
-from glob import glob
-import os
 
-package_name = 'camera_nodes'
+package_name = 'rfdetr_ros2'
 
 setup(
     name=package_name,
@@ -12,19 +10,16 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'),
-            glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='nils',
     maintainer_email='nils.treuheit@ovgu.de',
-    description='USB and RealSense camera nodes for ROS2',
+    description='RF-DETR object detection ROS2 node',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'usb_camera = camera_nodes.usb_camera_node:main',
-            'realsense_camera = camera_nodes.realsense_camera_node:main',
+            'rfdetr_node = rfdetr_ros2.rfdetr_node:main',
         ],
     },
 )

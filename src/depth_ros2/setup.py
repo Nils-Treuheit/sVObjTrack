@@ -1,8 +1,6 @@
 from setuptools import find_packages, setup
-from glob import glob
-import os
 
-package_name = 'camera_nodes'
+package_name = 'depth_ros2'
 
 setup(
     name=package_name,
@@ -12,19 +10,16 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'),
-            glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='nils',
     maintainer_email='nils.treuheit@ovgu.de',
-    description='USB and RealSense camera nodes for ROS2',
-    license='Apache-2.0',
+    description='Monocular depth estimation (HYDEN-MoGe_v2) ROS2 node',
+    license='FAIR-NC',
     entry_points={
         'console_scripts': [
-            'usb_camera = camera_nodes.usb_camera_node:main',
-            'realsense_camera = camera_nodes.realsense_camera_node:main',
+            'depth_node = depth_ros2.depth_node:main',
         ],
     },
 )

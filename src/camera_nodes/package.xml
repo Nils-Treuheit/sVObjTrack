@@ -18,6 +18,12 @@
   <test_depend>python3-pytest</test_depend>
 
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>viewer_ros2</exec_depend>
+  <exec_depend>yolo_ros2</exec_depend>
+  <exec_depend>locate_anything_ros2</exec_depend>
+  <exec_depend>orchestrator</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
