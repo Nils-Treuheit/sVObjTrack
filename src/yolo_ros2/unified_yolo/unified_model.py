@@ -20,12 +20,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Default base weights for unified (single-backbone) architecture
-BASE_WEIGHTS = "models/yolo26m.pt"
+from model_registry import MODELS_DIR
+
+# Default base weights — resolved via MODELS_DIR at import time
+BASE_WEIGHTS = str(MODELS_DIR / "yolo26m.pt")
 
 # Default base weights for fused (dual-backbone) architecture
-BASE_WEIGHTS_COCO = "models/yolo26s.pt"
-BASE_WEIGHTS_DOTA = "models/yolo26s-obb.pt"
+BASE_WEIGHTS_COCO = str(MODELS_DIR / "yolo26s.pt")
+BASE_WEIGHTS_DOTA = str(MODELS_DIR / "yolo26s-obb.pt")
 
 DOTA_CLASSES = [
     "plane", "ship", "storage-tank", "baseball-diamond", "tennis-court",
@@ -379,14 +381,14 @@ class UnifiedYOLO(nn.Module):
 
     def _build_fused(self, sd, ckpt):
         """Build DualBackboneOBB from yolo26s.pt + yolo26s-obb.pt bases."""
-        coco_weights = str(Path(self.checkpoint_path).parent.parent.parent
-                           / "models" / "yolo26s.pt")
-        if not Path(coco_weights).exists():
-            coco_weights = BASE_WEIGHTS_COCO
-        dota_weights = str(Path(self.checkpoint_path).parent.parent.parent
-                           / "models" / "yolo26s-obb.pt")
-        if not Path(dota_weights).exists():
-            dota_weights = BASE_WEIGHTS_DOTA
+        from model_registry import resolve_checkpoint, MODELS_DIR
+        try:
+            coco_weights = str(resolve_checkpoint('yolo26s.pt'))
+            dota_weights = str(resolve_checkpoint('yolo26s-obb.pt'))
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"Fused architecture requires yolo26s.pt and yolo26s-obb.pt "
+                f"in {MODELS_DIR}: {e}")
 
         print(f"[UnifiedYOLO] Fused arch: COCO={coco_weights}, DOTA={dota_weights}")
 

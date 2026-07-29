@@ -7,22 +7,25 @@ Subscribes to /camera/image_raw and publishes:
 The metric point model outputs (1,H,W,3) XYZ coordinates per pixel.
 Depth (Z channel) is extracted and published as the depth map.
 
-Model lives in a separate venv at:
-  /mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/metadepth/.venv
+Model lives in a separate venv discovered via model_registry.
+Checkpoint is downloaded from HuggingFace Hub on first use.
 """
 import os
 import sys
 import time
 import threading
 
-# Metadepth venv — add to sys.path before any heavy imports
-METADEPTH_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/metadepth/.venv/lib/python3.10/site-packages'
-if os.path.isdir(METADEPTH_VENV) and METADEPTH_VENV not in sys.path:
-    sys.path.insert(0, METADEPTH_VENV)
+from model_registry import metadepth_venv, metadepth_checkpoint
 
-METADEPTH_REPO = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/metadepth/repo'
-if os.path.isdir(METADEPTH_REPO) and METADEPTH_REPO not in sys.path:
-    sys.path.insert(0, METADEPTH_REPO)
+# Metadepth venv — add to sys.path before any heavy imports
+_md_sp = metadepth_venv() / 'lib' / 'python3.10' / 'site-packages'
+if _md_sp.is_dir() and str(_md_sp) not in sys.path:
+    sys.path.insert(0, str(_md_sp))
+
+# Metadepth repo source
+_md_repo = metadepth_venv().parent / 'repo'
+if _md_repo.is_dir() and str(_md_repo) not in sys.path:
+    sys.path.insert(0, str(_md_repo))
 
 import rclpy
 from rclpy.node import Node
@@ -31,9 +34,6 @@ from std_msgs.msg import String, Header
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-
-
-CHECKPOINT = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/metadepth/checkpoints/hyden_mogev2_metric_point_vitl_fp32_f1066593896.pth'
 
 
 class DepthNode(Node):
@@ -80,8 +80,11 @@ class DepthNode(Node):
         t0 = time.time()
         self.get_logger().info('Loading HYDEN-MoGe_v2 metric point model...')
 
+        ckpt = str(metadepth_checkpoint())
+        self.get_logger().info(f'Checkpoint: {ckpt}')
+
         self.model = HyDenMoGe(**MODEL_CONFIGS['vitl_dinov2'])
-        state = torch.load(CHECKPOINT, map_location='cpu', weights_only=True)
+        state = torch.load(ckpt, map_location='cpu', weights_only=True)
         self.model.load_state_dict(state)
         self.model = self.model.to(self.device).eval()
         self.get_logger().info(f'Model loaded in {time.time() - t0:.1f}s')

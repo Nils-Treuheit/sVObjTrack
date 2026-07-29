@@ -5,23 +5,25 @@ Runs SAM 3.1 inference and publishes:
   /sam3/debug_image    — annotated image with mask overlays
   /sam3/masks          — binary mask images
 
-SAM 3.1 lives in a separate uv venv at:
-  /mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/.venv
-The SAM3_VENV path is prepended to sys.path at import time.
+SAM 3.1 lives in a separate uv venv discovered via model_registry.
+Checkpoint is downloaded from HuggingFace Hub on first use.
 """
 import os
 import sys
 import time
 import threading
 
-# SAM3 venv — add to sys.path before any heavy imports
-SAM3_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/.venv/lib/python3.12/site-packages'
-if os.path.isdir(SAM3_VENV) and SAM3_VENV not in sys.path:
-    sys.path.insert(0, SAM3_VENV)
+from model_registry import sam3_venv, sam3_checkpoint
 
-SAM3_REPO = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/repo'
-if os.path.isdir(SAM3_REPO) and SAM3_REPO not in sys.path:
-    sys.path.insert(0, SAM3_REPO)
+# SAM3 venv — add site-packages to sys.path before any heavy imports
+_sam3_sp = sam3_venv() / 'lib' / 'python3.12' / 'site-packages'
+if _sam3_sp.is_dir() and str(_sam3_sp) not in sys.path:
+    sys.path.insert(0, str(_sam3_sp))
+
+# SAM3 repo source is inside the venv's parent (editable install)
+_sam3_repo = sam3_venv().parent
+if _sam3_repo.is_dir() and str(_sam3_repo) not in sys.path:
+    sys.path.insert(0, str(_sam3_repo))
 
 import rclpy
 from rclpy.node import Node
@@ -31,8 +33,6 @@ from vision_msgs.msg import Detection2DArray
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-
-CHECKPOINT = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/checkpoints/sam3.1_multiplex.pt'
 
 MASK_COLORS = [
     (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
@@ -91,8 +91,11 @@ class SAM3Node(Node):
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
+        ckpt = str(sam3_checkpoint())
+        self.get_logger().info(f'SAM 3.1 checkpoint: {ckpt}')
+
         self.model = build_sam3_image_model(
-            checkpoint_path=CHECKPOINT,
+            checkpoint_path=ckpt,
             load_from_HF=False,
         )
         self.processor = Sam3Processor(self.model)

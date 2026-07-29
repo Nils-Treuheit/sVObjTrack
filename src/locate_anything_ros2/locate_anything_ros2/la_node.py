@@ -51,8 +51,10 @@ try:
 except Exception:
     pass
 
-# LocateAnything imports — use absolute path (ROS2 workspace is separate from LA project)
-LA_PROJECT = Path("/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/locate_anything")
+# LocateAnything imports — resolved via model_registry
+from model_registry import la_project, la_trt_dir
+
+LA_PROJECT = la_project()
 sys.path.insert(0, str(LA_PROJECT))
 
 try:
@@ -64,7 +66,7 @@ except Exception as e:
 
 # Try TRT vision encoder — add TRT venv SP to END of sys.path (fallback)
 # to avoid slow sympy/mpmath cascade from global PYTHONPATH
-TRT_DIR = LA_PROJECT / "model" / "tensorRT"
+TRT_DIR = la_trt_dir()
 TRT_VENV_SP = TRT_DIR / ".venv" / "lib" / "python3.10" / "site-packages"
 if TRT_DIR.exists():
     sys.path.insert(0, str(TRT_DIR))

@@ -1,6 +1,8 @@
 import sys
 print(f"CURRENT PYTHON INTERPRETER: {sys.executable}")
 
+from model_registry import resolve_checkpoint, MODELS_DIR
+
 import rclpy
 from rclpy.node import Node
 
@@ -28,16 +30,16 @@ from os.path import basename
 from random import randint
 
 
-# Default Fallback Models
-MODEL_YOLO11 = "models/yolo11m.pt"
-MODEL_YOLO26 = "models/yolo26m.pt"
-MODEL_CUBIFIED = "models/yolo26-obb_cubified_v1.pt"
-MODEL_YOLO11_OBB = "models/yolo11s-obb.pt"
-MODEL_YOLO26_OBB = "models/yolo26s-obb.pt"
-MODEL_YOLO11_POSE = "models/yolo11s-pose.pt"
-MODEL_YOLO26_POSE = "models/yolo26s-pose.pt"
-MODEL_UNIFIED = "models/yolo26-obb_cubified_v2.pt"
-MODEL_YOLOWORLD = "models/yolov8s-worldv2.pt"
+# Default Fallback Models — resolved via model_registry
+MODEL_YOLO11 = "yolo11m.pt"
+MODEL_YOLO26 = "yolo26m.pt"
+MODEL_CUBIFIED = "yolo26-obb_cubified_v1.pt"
+MODEL_YOLO11_OBB = "yolo11s-obb.pt"
+MODEL_YOLO26_OBB = "yolo26s-obb.pt"
+MODEL_YOLO11_POSE = "yolo11s-pose.pt"
+MODEL_YOLO26_POSE = "yolo26s-pose.pt"
+MODEL_UNIFIED = "yolo26-obb_cubified_v3.pt"
+MODEL_YOLOWORLD = "yolov8s-worldv2.pt"
 NC_CUBE = 66
 NC_NORMAL = 95
 
@@ -103,6 +105,13 @@ class YOLONode(Node):
                 path = model_id
                 mtype = basename(model_id).strip().split(".")[0].split('-')[-1]
                 model_type = model_t if model_t else (mtype if mtype else "AABB")
+
+            # Resolve the path through model_registry (MODELS_DIR or HF Hub)
+            try:
+                path = str(resolve_checkpoint(path))
+            except FileNotFoundError as e:
+                self.get_logger().error(f'Model not found: {e}')
+
             return path, model_type
 
         self.declare_parameter("model_id", "")

@@ -18,4 +18,5 @@
   <export>
     <build_type>ament_python</build_type>
   </export>
+  <exec_depend>model_registry</exec_depend>
 </package>

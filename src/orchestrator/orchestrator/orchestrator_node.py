@@ -30,15 +30,10 @@ from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import String
 from vision_msgs.msg import Detection2DArray
 
-LA_PROJECT = "/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/locate_anything"
-LA_TRT = f"{LA_PROJECT}/model/tensorRT"
-
-RFDETR_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/rfdetr/.venv'
-
-SAM3_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/sam3/.venv'
+from model_registry import la_project, la_trt_dir, rfdetr_venv, sam3_venv
 
 _TRT_LIBS = (
-    f"{LA_TRT}/.venv/lib/python3.10/site-packages/tensorrt_libs:"
+    f"{la_trt_dir()}/.venv/lib/python3.10/site-packages/tensorrt_libs:"
     f"{os.path.expanduser('~')}/.local/lib/python3.10/site-packages/nvidia/cudnn/lib:"
     "/usr/local/cuda-12.8/lib64"
 )
@@ -161,7 +156,7 @@ class OrchestratorNode(Node):
         python = _find_venv_python()
         env = os.environ.copy()
         existing_pp = env.get('PYTHONPATH', '')
-        rf_site = f'{RFDETR_VENV}/lib/python3.10/site-packages'
+        rf_site = str(rfdetr_venv() / 'lib' / 'python3.10' / 'site-packages')
         env['PYTHONPATH'] = f'{rf_site}:{existing_pp}' if existing_pp else rf_site
         cmd = [python, '-m', 'rfdetr_ros2.rfdetr_node']
         self.get_logger().info(f'[Orch] Spawning RF-DETR: {" ".join(cmd)}')
@@ -196,7 +191,7 @@ class OrchestratorNode(Node):
             self.get_logger().error(f'[Orch] Failed to start depth node: {e}')
 
     def _start_sam3(self):
-        sam3_python = f'{SAM3_VENV}/bin/python3'
+        sam3_python = str(sam3_venv() / 'bin' / 'python3')
         if not os.path.isfile(sam3_python):
             self.get_logger().error(f'[Orch] SAM3 venv Python not found: {sam3_python}')
             return

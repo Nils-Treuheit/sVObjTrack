@@ -3,18 +3,18 @@
 Runs RF-DETR (Nano/Small/Medium/Large) with optimize_for_inference()
 for maximum FPS.  Publishes Detection2DArray and annotated debug image.
 
-The RF-DETR model lives in a separate venv at:
-  /mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/rfdetr/.venv
-The run_rfdetr_node.sh script adds this to PYTHONPATH automatically.
+The RF-DETR venv is discovered via model_registry.
 """
 import os
 import sys
 import time
 
-# RF-DETR venv path (set by run_rfdetr_node.sh or manually)
-RFDETR_VENV = '/mnt/HDD1/Project_Code/VLMexperiments/VLMcollection/rfdetr/.venv/lib/python3.10/site-packages'
-if os.path.isdir(RFDETR_VENV) and RFDETR_VENV not in sys.path:
-    sys.path.insert(0, RFDETR_VENV)
+from model_registry import rfdetr_venv
+
+# RF-DETR venv site-packages
+_rf_sp = rfdetr_venv() / 'lib' / 'python3.10' / 'site-packages'
+if _rf_sp.is_dir() and str(_rf_sp) not in sys.path:
+    sys.path.insert(0, str(_rf_sp))
 
 import rclpy
 from rclpy.node import Node
